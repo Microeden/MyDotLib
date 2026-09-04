@@ -1,0 +1,8 @@
+# Arduino build output
+build/
+
+# Arduino IDE and editor settings
+.vscode/
+*.code-workspace
+
+# Example microeden_secrets.h files are intentionally tracked as templates.

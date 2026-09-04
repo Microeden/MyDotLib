@@ -1,0 +1,30 @@
+# Syntax Coloring Map For MyDot
+
+# Datatypes (KEYWORD1)
+MyDot	KEYWORD1
+CloudWidget	KEYWORD1
+ColorWheel	KEYWORD1
+Level	KEYWORD1
+Slider	KEYWORD1
+Switch	KEYWORD1
+Pushbutton	KEYWORD1
+Led	KEYWORD1
+Photo	KEYWORD1
+Map	KEYWORD1
+# Methods and Functions (KEYWORD2)
+begin	KEYWORD2
+run	KEYWORD2
+beginWiFi	KEYWORD2
+beginCloud	KEYWORD2
+writeKeyWord	KEYWORD2
+readKeyWord	KEYWORD2
+sendCloud	KEYWORD2
+isCloudConnected	KEYWORD2
+onCommand	KEYWORD2
+setCloudBufferSize	KEYWORD2
+setCloudSync	KEYWORD2
+readSensors	KEYWORD2
+setFanSpeed	KEYWORD2
+setRelay	KEYWORD2
+setAllPixels	KEYWORD2
+displayPrint	KEYWORD2
