@@ -45,7 +45,7 @@
 #define RELAY 5
 #define PIN 6
 #define SD_CS 10
-#elif defined(ARDUINO_ARCH_RP2040) || defined(ARDUINO_SAMD_NANO_33_IOT)
+#elif defined(ARDUINO_ARCH_RP2040) || defined(ARDUINO_NANO_RP2040_CONNECT) || defined(ARDUINO_SAMD_NANO_33_IOT)
 #include <WiFiNINA.h>
 #define BUTTON_A A7
 #define BUTTON_B 4
@@ -81,7 +81,10 @@ public:
   // --- SD card ---
 
   bool beginSD();
-  File openFile(const char* filename, const char* mode = FILE_READ);
+  // `mode` uses the familiar SD strings: "r" (read), "w" (replace), or
+  // "a" (append). The implementation maps them to the selected board's SD
+  // library, whose native mode type differs between ESP32 and SAMD/RP2040.
+  File openFile(const char* filename, const char* mode = "r");
   bool fileExists(const char* filename);
   void removeFile(const char* filename);
   bool writeFile(const String& path, const String& message);
@@ -190,6 +193,18 @@ private:
   char _ssid[32];
   char _password[64];
 
+  // Connection lifecycle state.  Keeping this in the object (instead of in
+  // function-local static variables) prevents one MyDot instance from
+  // affecting another and lets run() resume a connection after a drop.
+  bool _wifiStarted = false;
+  bool _cloudConfigured = false;
+  bool _timeConfigured = false;
+  bool _wifiRestartPending = false;
+  unsigned long _lastWiFiAttempt = 0;
+  unsigned long _wifiRestartAt = 0;
+  unsigned long _lastMqttAttempt = 0;
+  uint8_t _mqttFailureCount = 0;
+
   Adafruit_SSD1306 display;
   Adafruit_NeoPixel pixels;
   Adafruit_BME680 bme;
@@ -278,6 +293,17 @@ class Slider : public CloudWidget<int> {
 public:
   Slider(const char* k, MyDot& d)
     : CloudWidget(k, d) {}
+
+  // Slider widget messages arrive as the compact text form "key_value".
+  // Return -1 when no value has been received yet so callers can distinguish
+  // an absent value from a valid slider value of 0.
+  int read() {
+    String value = _device->readKeyWord<String>(_key);
+    if (value.length() == 0) {
+      return -1;
+    }
+    return value.toInt();
+  }
 };
 class Switch : public CloudWidget<bool> {
 public:

@@ -17,6 +17,8 @@ void setup() {
 }
 
 void loop() {
+  // Keep the Wi-Fi station alive and allow automatic reconnection.
+  dot.run();
   Serial.println(dot.getWiFiRSSI());
   delay(5000);
 }

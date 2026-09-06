@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.5
+
+- Added automatic Wi-Fi and MQTT reconnection with stale-session recovery.
+- Added the MyDot Vase cloud/local lighting, pump, and soil-sensor example.
+- Added persistent light-state storage and documented the cloud widget APIs.
+- Improved Nano ESP32 and Nano RP2040 Connect compatibility.
+- Declared the SD and WiFiNINA dependencies for Library Manager installs.
+
 ## 1.0.4
 
 - Restructured the library according to the Arduino 1.5 library format.

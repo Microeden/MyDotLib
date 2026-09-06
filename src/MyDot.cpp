@@ -133,6 +133,10 @@ void MyDot::beginWiFi(const char* ssid, const char* password) {
   _ssid[sizeof(_ssid) - 1] = '\0';
   strncpy(_password, password, sizeof(_password) - 1);
   _password[sizeof(_password) - 1] = '\0';
+  _wifiStarted = true;
+  _timeConfigured = false;
+  _wifiRestartPending = false;
+  _lastWiFiAttempt = millis();
   if (displayPresent) {
     clearDisplay();
     setCursor(0, 0);
@@ -141,17 +145,26 @@ void MyDot::beginWiFi(const char* ssid, const char* password) {
     showDisplay();
   }
   WiFi.begin(ssid, password);
-  // Wi-Fi connection is deliberately blocking during setup for simple sketches.
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+  // Give simple sketches a chance to start online, but never block setup
+  // forever when the access point is unavailable.  run() continues the same
+  // connection attempt and retries it later without blocking the application.
+  const unsigned long WIFI_INITIAL_TIMEOUT = 15000;
+  unsigned long startedAt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < WIFI_INITIAL_TIMEOUT) {
+    delay(100);
   }
-  if (displayPresent) {
-    showDisplay();
-  }
+  if (WiFi.status() == WL_CONNECTED) {
+    if (displayPresent) {
+      showDisplay();
+    }
 #if defined(ARDUINO_ARCH_ESP32)
-  // TLS validation and getEpochTime() require a valid system clock on ESP32.
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    // TLS validation and getEpochTime() require a valid system clock on ESP32.
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    _timeConfigured = true;
 #endif
+  } else {
+    Serial.println("MyDot: Wi-Fi connection timed out; retrying in run().");
+  }
 }
 
 void MyDot::beginCloud(const char* deviceId, const char* token) {
@@ -172,6 +185,9 @@ void MyDot::beginCloud(const char* deviceId, const char* token) {
   _mqtt.setKeepAlive(60);
   _mqtt.setSocketTimeout(5);
   _mqtt.setBufferSize(1024);
+  _cloudConfigured = true;
+  _lastMqttAttempt = 0;
+  _mqttFailureCount = 0;
 }
 
 void MyDot::setCloudBufferSize(uint16_t size) {
@@ -186,52 +202,105 @@ void MyDot::setCloudSync(unsigned long interval, CloudSyncCallback callback) {
 void MyDot::run() {
   unsigned long now = millis();
 
-  // Reconnect Wi-Fi periodically. NINA-based boards require a short reset
-  // delay after disconnecting, while ESP32 can reconnect immediately.
-  if (WiFi.status() != WL_CONNECTED) {
-    static unsigned long lastWiFiRetry = 0;
-    static bool waitingNinaReset = false;
-    static unsigned long ninaResetTimer = 0;
-
-    if (!waitingNinaReset) {
-      if (now - lastWiFiRetry > 10000 || lastWiFiRetry == 0) {
-        lastWiFiRetry = now;
-
-#if defined(ARDUINO_ARCH_RP2040) || defined(ARDUINO_SAMD_NANO_33_IOT)
-        WiFi.disconnect();
-        waitingNinaReset = true;
-        ninaResetTimer = now;
-#else
-        WiFi.disconnect(true);
-        WiFi.begin(_ssid, _password);
-#endif
-      }
-    } else {
-
-      if (now - ninaResetTimer >= 500) {
-        waitingNinaReset = false;
-        WiFi.begin(_ssid, _password);
-      }
-    }
+  // run() is also used by peripheral-only sketches.  Do not touch the Wi-Fi
+  // driver until beginWiFi() has explicitly been requested.
+  if (!_wifiStarted) {
+    return;
   }
 
-  else {
-    // Reconnect MQTT once Wi-Fi is available, then process inbound packets.
-    if (!_mqtt.connected()) {
-      static unsigned long lastMqttRetry = 0;
-      if (now - lastMqttRetry > 5000 || lastMqttRetry == 0) {
-        lastMqttRetry = now;
-        _mqtt.disconnect();
+  // A lost Wi-Fi link invalidates MQTT immediately.  This is important on
+  // ESP32, where PubSubClient may otherwise still report the old TCP socket as
+  // connected for a short time after the access point disappears.
+  if (WiFi.status() != WL_CONNECTED) {
+    if (_mqtt.connected()) {
+      _mqtt.disconnect();
+      Serial.println("MyDot: Wi-Fi lost; MQTT disconnected.");
+    }
+#if defined(ARDUINO_ARCH_ESP32)
+    // Force NTP setup again after the station reconnects.  A new DHCP lease
+    // can leave the previous time service unavailable until it is requested.
+    _timeConfigured = false;
+#endif
 
-        if (_mqtt.connect(_clientId.c_str(), _deviceId.c_str(), _token.c_str())) {
-          _mqtt.subscribe(_topicIn.c_str());
+    // NINA boards are more reliable when the radio gets a short pause between
+    // disconnect() and begin().  ESP32 can restart the station directly.
+    if (_wifiRestartPending) {
+      if (now - _wifiRestartAt >= 500) {
+        _wifiRestartPending = false;
+        WiFi.begin(_ssid, _password);
+        _lastWiFiAttempt = now;
+        Serial.println("MyDot: Wi-Fi reconnect attempt.");
+      }
+    } else if (_lastWiFiAttempt == 0 || now - _lastWiFiAttempt >= 10000) {
+      _lastWiFiAttempt = now;
+      WiFi.disconnect();
+#if defined(ARDUINO_ARCH_RP2040) || defined(ARDUINO_NANO_RP2040_CONNECT) || defined(ARDUINO_SAMD_NANO_33_IOT)
+      _wifiRestartPending = true;
+      _wifiRestartAt = now;
+#else
+      WiFi.begin(_ssid, _password);
+      Serial.println("MyDot: Wi-Fi reconnect attempt.");
+#endif
+    }
+    return;
+  }
+
+  // The link is back.  Clear any NINA restart state and restore NTP setup
+  // after a reconnect so TLS and time helpers remain usable.
+  _wifiRestartPending = false;
+#if defined(ARDUINO_ARCH_ESP32)
+  if (!_timeConfigured) {
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    _timeConfigured = true;
+  }
+#endif
+
+  if (!_cloudConfigured) {
+    return;
+  }
+
+  // Reconnect MQTT once Wi-Fi is available, then process inbound packets.
+  if (!_mqtt.connected()) {
+    if (_lastMqttAttempt == 0 || now - _lastMqttAttempt >= 5000) {
+      _lastMqttAttempt = now;
+      _mqtt.disconnect();
+
+      if (_mqtt.connect(_clientId.c_str(), _deviceId.c_str(), _token.c_str())) {
+        if (_mqtt.subscribe(_topicIn.c_str())) {
+          _mqttFailureCount = 0;
+          Serial.println("MyDot: MQTT connected.");
         } else {
-          //
+          Serial.println("MyDot: MQTT connected, but subscription failed.");
+          _mqtt.disconnect();
+        }
+      } else {
+        if (_mqttFailureCount < 255) {
+          ++_mqttFailureCount;
+        }
+        Serial.print("MyDot: MQTT reconnect failed (state ");
+        Serial.print(_mqtt.state());
+        Serial.println(").");
+
+        // If the station still reports WL_CONNECTED but the Internet path is
+        // gone, retrying the same TCP stack forever is not enough.  After
+        // three failed broker attempts, restart Wi-Fi as well; the normal
+        // branch above will then bring MQTT back up on the fresh link.
+        if (_mqttFailureCount >= 3) {
+          _mqttFailureCount = 0;
+          WiFi.disconnect();
+#if defined(ARDUINO_ARCH_RP2040) || defined(ARDUINO_NANO_RP2040_CONNECT) || defined(ARDUINO_SAMD_NANO_33_IOT)
+          _wifiRestartPending = true;
+          _wifiRestartAt = now;
+#else
+          WiFi.begin(_ssid, _password);
+          Serial.println("MyDot: restarting Wi-Fi after repeated MQTT failures.");
+#endif
+          _lastWiFiAttempt = now;
         }
       }
-    } else {
-      _mqtt.loop();
     }
+  } else {
+    _mqtt.loop();
   }
 
 
@@ -270,7 +339,7 @@ bool MyDot::isCloudConnected() {
 }
 
 bool MyDot::onCommand(const char* expectedCmd, const char* key) {
-  if (_lastInboundDoc.containsKey(key)) {
+  if (!_lastInboundDoc[key].isNull()) {
     String currentCmd = _lastInboundDoc[key].as<String>();
     if (currentCmd == expectedCmd) {
       // Consume a command after matching so it is delivered only once.
@@ -339,8 +408,14 @@ void MyDot::begin() {
 // --- Buttons and relay ---
 
 bool MyDot::isButtonAPressed() {
-#if defined(ARDUINO_ARCH_RP2040)
+#if defined(ARDUINO_ARCH_RP2040) || defined(ARDUINO_NANO_RP2040_CONNECT)
+#if defined(PIN_NINA_GPIO0)
   return !digitalRead(PIN_NINA_GPIO0);
+#elif defined(NINA_GPIO0)
+  return !digitalRead(NINA_GPIO0);
+#else
+  return !digitalRead(BUTTON_A);
+#endif
 #else
   return !digitalRead(BUTTON_A);
 #endif
@@ -543,7 +618,22 @@ bool MyDot::beginSD() {
 }
 
 File MyDot::openFile(const char* filename, const char* mode) {
+#if defined(ARDUINO_ARCH_ESP32)
   return SD.open(filename, mode);
+#else
+  // The Arduino SD library used by SAMD/RP2040 boards accepts numeric
+  // OpenMode flags, while the ESP32 SD library accepts mode strings.
+  int sdMode = FILE_READ;
+  if (mode != nullptr) {
+    if (strcmp(mode, "w") == 0) {
+      SD.remove(filename);
+      sdMode = FILE_WRITE;
+    } else if (strcmp(mode, "a") == 0) {
+      sdMode = FILE_WRITE;
+    }
+  }
+  return SD.open(filename, sdMode);
+#endif
 }
 
 bool MyDot::fileExists(const char* filename) {

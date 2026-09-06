@@ -6,7 +6,7 @@ Arduino library for the Microeden MyDot board and the Microeden cloud platform.
 
 Install **MyDot** from the Arduino IDE Library Manager. The IDE installs the declared
 dependencies when possible: Adafruit NeoPixel, Adafruit SSD1306, Adafruit BME680,
-PubSubClient, and ArduinoJson.
+PubSubClient, ArduinoJson, SD, and WiFiNINA.
 
 The onboard MyDot environmental sensor is a BME690; the implementation uses the
 compatible Adafruit BME680 driver API.
@@ -30,7 +30,7 @@ Diagnostic examples use the Serial Monitor at 115200 baud; **Display** demonstra
 
 ## Supported boards and pin mapping
 
-The library supports ESP32, SAMD, and RP2040 Wi-Fi boards. For an **Arduino Nano
+The library supports ESP32, SAMD, RP2040, and Mbed Nano Wi-Fi boards. For an **Arduino Nano
 ESP32** with the MyDot shield, it uses the board
 aliases from the MyDot pinout: `A7` (button A), `D4` (button B), `D2` (relay),
 `D3` (LEDs), and `D10` (SD card). This works with either Arduino pin numbering
@@ -41,7 +41,9 @@ converts `D3` to its physical ESP32 GPIO before initializing the ESP32 LED drive
 
 `beginCloud()` automatically configures the bundled Let’s Encrypt **ISRG Root X1**
 certificate on ESP32. It does not use insecure TLS. `beginWiFi()` configures NTP on
-ESP32, so call it before `beginCloud()` and allow the connection to complete.
+ESP32, so call it before `beginCloud()` and keep calling `dot.run()` in `loop()`.
+If Wi-Fi drops, `run()` disconnects the stale MQTT session and retries Wi-Fi and
+MQTT automatically.
 
 ## Carrier power
 
