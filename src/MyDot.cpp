@@ -13,7 +13,9 @@ void MyDot::mqttCallback(char* topic, byte* payload, unsigned int length) {
   if (!_instance) return;
 
   // Keep the raw incoming document for onCommand(), then mirror each field in
-  // _stateDoc so typed widgets can read the latest known cloud state.
+  // _stateDoc so typed widgets can read the latest known cloud state. Compact
+  // widget messages are also copied to _pendingWidgetDoc: widgets must consume
+  // those events once instead of treating a cached/echoed state as a command.
   JsonDocument incoming;
   DeserializationError error = deserializeJson(incoming, payload, length);
   if (!error) {
@@ -30,6 +32,7 @@ void MyDot::mqttCallback(char* topic, byte* payload, unsigned int length) {
             String realKey = String(val).substring(0, prefixLen);
             String realVal = String(sep + 1);
             _instance->_stateDoc[realKey] = realVal;
+            _instance->_pendingWidgetDoc[realKey] = realVal;
           }
         }
       } else {

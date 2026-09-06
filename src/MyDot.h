@@ -120,6 +120,20 @@ public:
     return _stateDoc[key].as<T>();
   }
 
+  // Reads and consumes a newly received compact widget value. Unlike
+  // readKeyWord(), this does not return an old value from the cached cloud
+  // state, so a telemetry/state echo cannot be mistaken for a new command.
+  template<typename T>
+  bool readKeyWordOnce(const char* key, T& value) {
+    if (_pendingWidgetDoc[key].isNull()) {
+      return false;
+    }
+
+    value = _pendingWidgetDoc[key].as<T>();
+    _pendingWidgetDoc.remove(key);
+    return true;
+  }
+
   bool sendCloud();
   bool isCloudConnected();
   void setCloudBufferSize(uint16_t size);
@@ -238,6 +252,7 @@ private:
   JsonDocument _payloadDoc;
   JsonDocument _lastInboundDoc;
   JsonDocument _stateDoc;
+  JsonDocument _pendingWidgetDoc;
 
   // PubSubClient requires a static callback, so it forwards to this instance.
   static MyDot* _instance;
@@ -295,11 +310,11 @@ public:
     : CloudWidget(k, d) {}
 
   // Slider widget messages arrive as the compact text form "key_value".
-  // Return -1 when no value has been received yet so callers can distinguish
-  // an absent value from a valid slider value of 0.
+  // Consume only a newly received widget event. Return -1 when there is no
+  // new value so a cached/echoed cloud state cannot reset the application.
   int read() {
-    String value = _device->readKeyWord<String>(_key);
-    if (value.length() == 0) {
+    String value;
+    if (!_device->readKeyWordOnce<String>(_key, value)) {
       return -1;
     }
     return value.toInt();

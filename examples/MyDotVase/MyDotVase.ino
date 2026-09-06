@@ -12,8 +12,7 @@
  *   "lights_warm" / "lights_cool" - selects the color temperature
  *   "grow_veg" / "grow_bloom" / "grow_full" - selects a grow-light mode
  *   "lights_mode" with a numeric "mode" field from 0 to 4
- *   "brightness" with a numeric "brightness" field from 0 to 255
- *   or the compact widget form "brightness_128"
+ *   or the Slider widget form "brightness_128"
  *
  * Every pump activation increments pumpActivations and publishes telemetry.
  * A periodic telemetry message is also sent every five seconds.
@@ -367,8 +366,8 @@ void handleCloudCommands() {
 
 void handleCloudBrightnessSlider() {
   // The Slider widget receives the compact form "brightness_128". Its read()
-  // method converts the parsed value to an integer and returns -1 until the
-  // first slider message arrives.
+  // method consumes each new slider event once and returns -1 when there is no
+  // new event, so a cloud state echo cannot overwrite the saved value.
   int requestedBrightness = brightnessSlider.read();
   if (requestedBrightness < 0) {
     return;
