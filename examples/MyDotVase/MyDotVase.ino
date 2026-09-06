@@ -210,12 +210,16 @@ void serviceTimedPump() {
 }
 
 void applyLights() {
+  // Apply the saved brightness even while the lights are off. This keeps the
+  // NeoPixel driver's brightness register synchronized with persistent state,
+  // so the next local/cloud lights-on action uses the restored level.
+  dot.setBrightness(ledBrightness);
+
   if (!lightsOn) {
     dot.clearPixels();
     return;
   }
 
-  dot.setBrightness(ledBrightness);
   switch (lightMode) {
     case LIGHT_MODE_WARM_WHITE:
       dot.setAllPixels(WARM_WHITE_R, WARM_WHITE_G, WARM_WHITE_B);
@@ -261,11 +265,21 @@ void cycleLightMode() {
 }
 
 void setLightBrightness(int brightness) {
-  ledBrightness = (uint8_t)constrain(brightness, 0, 255);
+  uint8_t requestedBrightness = (uint8_t)constrain(brightness, 0, 255);
+  if (requestedBrightness == ledBrightness) {
+    return;
+  }
+
+  ledBrightness = requestedBrightness;
   applyLights();
 
+  // Persist immediately. The delayed part below is only used to coalesce
+  // telemetry while a slider is being dragged; a reset immediately after a
+  // change must never lose the selected brightness.
+  saveLightState();
+
   // A slider can generate many values while it is being dragged. Apply each
-  // value immediately, then persist and publish only the final settled value.
+  // value immediately, then publish only the final settled value.
   brightnessUpdatePending = true;
   brightnessChangedAt = millis();
 }
@@ -277,7 +291,6 @@ void servicePendingBrightnessUpdate() {
   }
 
   brightnessUpdatePending = false;
-  saveLightState();
   publishTelemetry("brightness");
 }
 
