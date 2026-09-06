@@ -15,6 +15,8 @@ jobs:
         uses: arduino/arduino-lint-action@v3
         with:
           compliance: specification
-          library-manager: submit
+          # MyDot is already listed in the Arduino Library Manager. Use the
+          # update mode for subsequent releases instead of submit mode.
+          library-manager: update
           project-type: library
           recursive: false
