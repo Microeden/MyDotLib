@@ -37,13 +37,9 @@ Scarica e stampa i seguenti file per assemblare il Vase Kit:
 | --- | --- | --- |
 | `column.stl` | Colonna; da stampare o scalare in base all'altezza della pianta | [Scarica STL](https://microeden.io/files/mydot/vasekit/column.stl) |
 | `mydot_pump_support.stl` | Supporto pompa | [Scarica STL](https://microeden.io/files/mydot/vasekit/mydot_pump_support.stl) |
-| `mydot_pump_support.stl` | Supporto case MyDot | [Scarica STL](https://microeden.io/files/mydot/vasekit/mydot_pump_support.stl) |
+| `mydot_support.stl` | Supporto case MyDot | [Scarica STL](https://microeden.io/files/mydot/vasekit/mydot_support.stl) |
 | `vase_bottom.stl` | Sottovaso | [Scarica STL](https://microeden.io/files/mydot/vasekit/vase_bottom.stl) |
 | `vase_top.stl` | Vaso | [Scarica STL](https://microeden.io/files/mydot/vasekit/vase_top.stl) |
-
-Lo stesso URL `mydot_pump_support.stl` è stato fornito sia per il supporto
-pompa sia per il supporto del case MyDot. Verifica il secondo link prima della
-stampa se devono essere due componenti distinti.
 
 Il file `column.stl` deve essere stampato con un'altezza adatta alla pianta
 utilizzata. Prima dello slicing regola la scala sull'asse Z oppure scegli

@@ -35,13 +35,9 @@ Download and print the following files for the Vase Kit assembly:
 | --- | --- | --- |
 | `column.stl` | Column; print or scale it according to the plant height | [Download STL](https://microeden.io/files/mydot/vasekit/column.stl) |
 | `mydot_pump_support.stl` | Pump support | [Download STL](https://microeden.io/files/mydot/vasekit/mydot_pump_support.stl) |
-| `mydot_pump_support.stl` | MyDot case support | [Download STL](https://microeden.io/files/mydot/vasekit/mydot_pump_support.stl) |
+| `mydot_support.stl` | MyDot case support | [Download STL](https://microeden.io/files/mydot/vasekit/mydot_support.stl) |
 | `vase_bottom.stl` | Water tray / vase bottom | [Download STL](https://microeden.io/files/mydot/vasekit/vase_bottom.stl) |
 | `vase_top.stl` | Vase top | [Download STL](https://microeden.io/files/mydot/vasekit/vase_top.stl) |
-
-The same `mydot_pump_support.stl` URL was supplied for both the pump support
-and the MyDot case support. Verify the second link before printing if these are
-intended to be separate parts.
 
 The `column.stl` must be printed at a height suitable for the plant being used.
 Adjust its Z scale or select the appropriate print height before slicing; do not
