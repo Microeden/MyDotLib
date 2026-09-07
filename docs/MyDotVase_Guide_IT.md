@@ -35,16 +35,15 @@ Scarica e stampa i seguenti file per assemblare il Vase Kit:
 
 | File | Componente | STL |
 | --- | --- | --- |
-| `column.stl` | Colonna; da stampare o scalare in base all'altezza della pianta | [Scarica STL](https://microeden.io/files/mydot/vasekit/column.stl) |
+| `column.stl` | Sezione standard della colonna; stampare il numero di pezzi necessario per l'altezza della pianta | [Scarica STL](https://microeden.io/files/mydot/vasekit/column.stl) |
 | `mydot_pump_support.stl` | Supporto pompa | [Scarica STL](https://microeden.io/files/mydot/vasekit/mydot_pump_support.stl) |
 | `mydot_support.stl` | Supporto case MyDot | [Scarica STL](https://microeden.io/files/mydot/vasekit/mydot_support.stl) |
 | `vase_bottom.stl` | Sottovaso | [Scarica STL](https://microeden.io/files/mydot/vasekit/vase_bottom.stl) |
 | `vase_top.stl` | Vaso | [Scarica STL](https://microeden.io/files/mydot/vasekit/vase_top.stl) |
 
-Il file `column.stl` deve essere stampato con un'altezza adatta alla pianta
-utilizzata. Prima dello slicing regola la scala sull'asse Z oppure scegli
-l'altezza di stampa appropriata; non assumere che una singola altezza della
-colonna sia adatta a tutte le piante.
+Il file `column.stl` è una sezione standard della colonna. Stampa il numero di
+pezzi identici necessario in base all'altezza della pianta e assemblali tra
+loro. Non scalare il file e non modificare l'altezza della singola sezione.
 
 ### Materiali esterni consigliati
 
@@ -230,6 +229,21 @@ continuamente la pompa.
 
 Il cooldown protegge il funzionamento durante l'avvio corrente. Viene azzerato
 al riavvio della scheda; la durata configurata invece rimane salvata.
+
+### Gestione dell'acqua
+
+Prima di avviare un ciclo di irrigazione controlla che ci sia acqua disponibile
+nel sottovaso/serbatoio. Dopo l'irrigazione controlla il sottovaso e ricordati di
+svuotarlo periodicamente, per evitare ristagni o traboccamenti. Il sottovaso va
+controllato e svuotato regolarmente durante la normale manutenzione.
+
+Per il Vase Kit stampabile in 3D, inizia impostando una durata di irrigazione di
+**massimo un secondo**. Il kit stampabile ha una capacità d'acqua ridotta e un
+ciclo più lungo può riempire rapidamente il sottovaso. Se la pompa viene usata
+con un sistema diverso o con un vaso più grande, regola il tempo di irrigazione
+in base alle dimensioni del vaso, al tubo, alla portata della pompa e al
+drenaggio. Prima di abilitare il funzionamento automatico prova sempre la durata
+scelta sotto supervisione.
 
 ## 7. Calibrazione del sensore terreno
 

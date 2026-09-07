@@ -33,15 +33,15 @@ Download and print the following files for the Vase Kit assembly:
 
 | File | Component | STL |
 | --- | --- | --- |
-| `column.stl` | Column; print or scale it according to the plant height | [Download STL](https://microeden.io/files/mydot/vasekit/column.stl) |
+| `column.stl` | Standard column section; print the required number of pieces for the plant height | [Download STL](https://microeden.io/files/mydot/vasekit/column.stl) |
 | `mydot_pump_support.stl` | Pump support | [Download STL](https://microeden.io/files/mydot/vasekit/mydot_pump_support.stl) |
 | `mydot_support.stl` | MyDot case support | [Download STL](https://microeden.io/files/mydot/vasekit/mydot_support.stl) |
 | `vase_bottom.stl` | Water tray / vase bottom | [Download STL](https://microeden.io/files/mydot/vasekit/vase_bottom.stl) |
 | `vase_top.stl` | Vase top | [Download STL](https://microeden.io/files/mydot/vasekit/vase_top.stl) |
 
-The `column.stl` must be printed at a height suitable for the plant being used.
-Adjust its Z scale or select the appropriate print height before slicing; do not
-assume that one fixed column height fits every plant.
+The `column.stl` is a standard-length column section. Print the required number
+of identical pieces according to the height of the plant and assemble them
+together. Do not scale the file or alter the height of an individual section.
 
 ### Suggested external materials
 
@@ -223,6 +223,20 @@ from continuously restarting the pump.
 
 The cooldown is runtime protection. It is reset when the board reboots; the
 configured duration itself remains persistent.
+
+### Water management
+
+Before starting an irrigation cycle, check that there is water available in the
+tray/reservoir. Check the tray after watering and empty it periodically, so
+water does not remain stagnant or overflow. The tray should be inspected and
+emptied regularly as part of normal maintenance.
+
+For the 3D-printable Vase Kit, start with a pump duration of **one second at
+most**. The printed kit has a small water capacity, so longer cycles can quickly
+overfill the tray. If the pump is used with a different system or a larger pot,
+adjust the irrigation duration to the pot size, tubing, pump flow rate, and
+drainage. Test the selected duration with supervision before enabling automatic
+operation.
 
 ## 7. Soil calibration
 
