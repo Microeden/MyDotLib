@@ -131,8 +131,8 @@ libreria. Non è necessario abilitare TLS insicuro.
 
 Il codice si trova in:
 
-- [`examples/MyDotVase/MyDotVase.ino`](../examples/MyDotVase/MyDotVase.ino)
-- [`examples/MyDotVase/MyDotVaseState.h`](../examples/MyDotVase/MyDotVaseState.h)
+- [`examples/MyDotVase/MyDotVase.ino`](https://github.com/Microeden/MyDotLib/blob/main/examples/MyDotVase/MyDotVase.ino)
+- [`examples/MyDotVase/MyDotVaseState.h`](https://github.com/Microeden/MyDotLib/blob/main/examples/MyDotVase/MyDotVaseState.h)
 
 Lo sketch esegue queste operazioni:
 
