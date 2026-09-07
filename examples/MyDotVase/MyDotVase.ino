@@ -5,16 +5,17 @@
  * reading to the Microeden cloud. The MyDot relay is used as the pump output.
  *
  * Cloud commands (the default command key is "content"):
- *   "on"   - keeps the pump relay on
- *   "off"  - turns the pump relay off
- *   "pump" - turns the pump on for two seconds, then turns it off
+ *   "pump" - turns the pump on for the configured number of seconds
  *   "lights_on" / "lights_off" - switches the NeoPixel lights
  *   "lights_warm" / "lights_cool" - selects the color temperature
  *   "grow_veg" / "grow_bloom" / "grow_full" - selects a grow-light mode
  *   "lights_mode" with a numeric "mode" field from 0 to 4
- *   or the Slider widget form "brightness_128"
+ *   Slider widget forms "brightness_128" and "pumpDuration_5"
  *
  * Every pump activation increments pumpActivations and publishes telemetry.
+ * The pumpDuration slider selects 1 to 60 seconds and is stored in nonvolatile
+ * memory with the light settings. A pump activation is allowed at most once
+ * per minute; repeated commands during the cycle or cooldown are ignored.
  * A periodic telemetry message is also sent every five seconds.
  * Button A toggles the lights locally; button B cycles through all light modes.
  *
@@ -33,7 +34,9 @@
 MyDot dot;
 MyDotVaseStateStore lightStateStore;
 Slider brightnessSlider("brightness", dot);
-Switch pumpStateWidget("pumpOn", dot);
+Slider pumpDurationSlider("pumpDuration", dot);
+// Read-only cloud indicator; pump activation is controlled only by "pump".
+Led pumpStateWidget("pumpOn", dot);
 Switch lightsStateWidget("lightsOn", dot);
 Level lightModeWidget("lightModeIndex", dot);
 
@@ -42,9 +45,13 @@ Level lightModeWidget("lightModeIndex", dot);
 #define LIGHT_TOGGLE_BUTTON BUTTON_A
 #define LIGHT_TEMPERATURE_BUTTON BUTTON_B
 
-const unsigned long PUMP_DURATION_MS = 2000;
+const uint8_t DEFAULT_PUMP_DURATION_SECONDS = MYDOT_VASE_DEFAULT_PUMP_DURATION_SECONDS;
+const uint8_t MIN_PUMP_DURATION_SECONDS = 1;
+const uint8_t MAX_PUMP_DURATION_SECONDS = 60;
+const unsigned long PUMP_COOLDOWN_MS = 60000UL;
 const unsigned long TELEMETRY_INTERVAL_MS = 5000;
 const unsigned long BRIGHTNESS_SETTLE_MS = 300;
+const unsigned long PUMP_DURATION_SETTLE_MS = 300;
 
 // Calibrate these values with the actual sensor and soil. The AZ-Delivery
 // analog output normally decreases as the soil becomes wetter.
@@ -81,19 +88,25 @@ enum LightMode {
 bool pumpOn = false;
 bool timedPumpActive = false;
 unsigned long timedPumpStopAt = 0;
+unsigned long pumpCooldownUntil = 0;
 unsigned long pumpActivations = 0;
+uint8_t pumpDurationSeconds = DEFAULT_PUMP_DURATION_SECONDS;
 bool lightsOn = false;
 LightMode lightMode = LIGHT_MODE_COOL_WHITE;
 uint8_t ledBrightness = 128;
 int lastCloudBrightness = -1;
 bool brightnessUpdatePending = false;
 unsigned long brightnessChangedAt = 0;
+int lastCloudPumpDuration = -1;
+bool pumpDurationUpdatePending = false;
+unsigned long pumpDurationChangedAt = 0;
 
 void saveLightState() {
   MyDotVaseLightState state;
   state.lightsOn = lightsOn;
   state.mode = (uint8_t)lightMode;
   state.brightness = ledBrightness;
+  state.pumpDurationSeconds = pumpDurationSeconds;
 
   if (!lightStateStore.save(state)) {
     Serial.println("Warning: unable to save light state");
@@ -140,6 +153,9 @@ void publishTelemetry(const char* eventName) {
   lightModeWidget.write((int)lightMode);
   // The cloud Slider is bound to the key "brightness".
   brightnessSlider.write((int)ledBrightness);
+  // The pump slider stores the duration in seconds; the "pump" command uses
+  // this value for the next timed activation.
+  pumpDurationSlider.write((int)pumpDurationSeconds);
   dot.writeKeyWord("event", eventName);
   dot.sendCloud();
 
@@ -155,6 +171,8 @@ void publishTelemetry(const char* eventName) {
   Serial.print(lightModeName());
   Serial.print(", brightness: ");
   Serial.print(ledBrightness);
+  Serial.print(", pumpDurationSeconds: ");
+  Serial.print(pumpDurationSeconds);
   Serial.print(", event: ");
   Serial.println(eventName);
 }
@@ -163,34 +181,36 @@ void publishPeriodicTelemetry() {
   publishTelemetry("periodic");
 }
 
-void turnPumpOn() {
-  if (!pumpOn) {
-    dot.setRelay(true);
-    pumpOn = true;
+void startTimedPump() {
+  // Ignore repeated requests while the current timed cycle is active. There
+  // is intentionally no continuous on/off control for the pump anymore.
+  if (timedPumpActive) {
+    Serial.println("Pump request ignored: a timed cycle is already active");
+    publishTelemetry("pumpBusy");
+    return;
   }
 
-  // A manual "on" command cancels an active two-second timer.
-  timedPumpActive = false;
-  // Publish the state even when the relay was already on, so the cloud gets
-  // an acknowledgement for every explicit "on" command.
-  publishTelemetry("on");
-}
+  // A second safety layer prevents a new activation until one minute has
+  // elapsed from the previous activation, even after the timed cycle ended.
+  if ((long)(millis() - pumpCooldownUntil) < 0) {
+    unsigned long remainingMs = pumpCooldownUntil - millis();
+    Serial.print("Pump request ignored: cooldown active for ");
+    Serial.print((remainingMs + 999UL) / 1000UL);
+    Serial.println(" more seconds");
+    publishTelemetry("pumpCooldown");
+    return;
+  }
 
-void turnPumpOff() {
-  dot.setRelay(false);
-  pumpOn = false;
-  timedPumpActive = false;
-  publishTelemetry("off");
-}
-
-void startTimedPump() {
   dot.setRelay(true);
   pumpOn = true;
   timedPumpActive = true;
-  timedPumpStopAt = millis() + PUMP_DURATION_MS;
+  unsigned long startedAt = millis();
+  timedPumpStopAt = startedAt + (unsigned long)pumpDurationSeconds * 1000UL;
+  pumpCooldownUntil = startedAt + PUMP_COOLDOWN_MS;
   ++pumpActivations;
 
-  // This message is sent immediately when the pump is activated.
+  // This message is sent immediately when the pump is activated. The
+  // configured duration is included in the telemetry payload.
   publishTelemetry("pump");
 }
 
@@ -293,11 +313,39 @@ void servicePendingBrightnessUpdate() {
   publishTelemetry("brightness");
 }
 
+void setPumpDurationSeconds(int seconds) {
+  uint8_t requestedDuration = (uint8_t)constrain(
+      seconds, MIN_PUMP_DURATION_SECONDS, MAX_PUMP_DURATION_SECONDS);
+  if (requestedDuration == pumpDurationSeconds) {
+    return;
+  }
+
+  pumpDurationSeconds = requestedDuration;
+  saveLightState();
+
+  // Coalesce telemetry while the cloud slider is being dragged. The new
+  // duration is nevertheless stored immediately so a reset cannot lose it.
+  pumpDurationUpdatePending = true;
+  pumpDurationChangedAt = millis();
+}
+
+void servicePendingPumpDurationUpdate() {
+  if (!pumpDurationUpdatePending ||
+      millis() - pumpDurationChangedAt < PUMP_DURATION_SETTLE_MS) {
+    return;
+  }
+
+  pumpDurationUpdatePending = false;
+  publishTelemetry("pumpDuration");
+}
+
 void restoreLightState() {
   MyDotVaseLightState state;
   if (!lightStateStore.load(state)) {
     Serial.println("No saved light state; using defaults");
     lastCloudBrightness = ledBrightness;
+    pumpDurationSeconds = DEFAULT_PUMP_DURATION_SECONDS;
+    lastCloudPumpDuration = pumpDurationSeconds;
     applyLights();
     return;
   }
@@ -307,7 +355,12 @@ void restoreLightState() {
                 ? (LightMode)state.mode
                 : LIGHT_MODE_COOL_WHITE;
   ledBrightness = state.brightness;
+  pumpDurationSeconds = (state.pumpDurationSeconds >= MIN_PUMP_DURATION_SECONDS &&
+                         state.pumpDurationSeconds <= MAX_PUMP_DURATION_SECONDS)
+                          ? state.pumpDurationSeconds
+                          : DEFAULT_PUMP_DURATION_SECONDS;
   lastCloudBrightness = ledBrightness;
+  lastCloudPumpDuration = pumpDurationSeconds;
   applyLights();
 
   Serial.print("Restored light state: ");
@@ -315,17 +368,12 @@ void restoreLightState() {
   Serial.print(lightModeName());
   Serial.print(", brightness ");
   Serial.println(ledBrightness);
+  Serial.print("Restored pump duration: ");
+  Serial.print(pumpDurationSeconds);
+  Serial.println(" seconds");
 }
 
 void handleCloudCommands() {
-  if (dot.onCommand("on")) {
-    turnPumpOn();
-  }
-
-  if (dot.onCommand("off")) {
-    turnPumpOff();
-  }
-
   if (dot.onCommand("pump")) {
     startTimedPump();
   }
@@ -361,6 +409,26 @@ void handleCloudCommands() {
   // Expected command JSON: {"content":"lights_mode", "mode":2}
   if (dot.onCommand("lights_mode")) {
     setLightModeIndex(dot.readKeyWord<int>("mode"));
+  }
+}
+
+void handleCloudPumpDurationSlider() {
+  // The Slider widget receives the compact form "pumpDuration_5". Its read()
+  // method consumes each new event once and returns -1 when idle.
+  int requestedDuration = pumpDurationSlider.read();
+  if (requestedDuration < 0) {
+    return;
+  }
+
+  requestedDuration = constrain(requestedDuration,
+                                MIN_PUMP_DURATION_SECONDS,
+                                MAX_PUMP_DURATION_SECONDS);
+  if (requestedDuration != lastCloudPumpDuration) {
+    lastCloudPumpDuration = requestedDuration;
+    Serial.print("Pump duration from cloud: ");
+    Serial.print(requestedDuration);
+    Serial.println(" seconds");
+    setPumpDurationSeconds(requestedDuration);
   }
 }
 
@@ -428,6 +496,8 @@ void loop() {
 
   dot.run();
   handleCloudCommands();
+  handleCloudPumpDurationSlider();
   handleCloudBrightnessSlider();
   servicePendingBrightnessUpdate();
+  servicePendingPumpDurationUpdate();
 }

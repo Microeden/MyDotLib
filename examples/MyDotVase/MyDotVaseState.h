@@ -10,7 +10,7 @@
  *   - RP2040 cores that provide EEPROM: EEPROM
  *   - Nano 33 IoT: EEPROM emulation
  *
- * The record contains only the light state: on/off, mode, and brightness.
+ * The record contains the light state and the configured pump duration.
  */
 
 #include <Arduino.h>
@@ -41,7 +41,10 @@ struct MyDotVaseLightState {
   bool lightsOn;
   uint8_t mode;
   uint8_t brightness;
+  uint8_t pumpDurationSeconds;
 };
+
+static const uint8_t MYDOT_VASE_DEFAULT_PUMP_DURATION_SECONDS = 2;
 
 class MyDotVaseStateStore {
 public:
@@ -68,13 +71,25 @@ public:
     }
 
     Record record;
-    if (!readRecord(record) || !isValid(record)) {
+    if (readRecord(record) && isValid(record)) {
+      state.lightsOn = record.lightsOn != 0;
+      state.mode = record.mode;
+      state.brightness = record.brightness;
+      state.pumpDurationSeconds = record.pumpDurationSeconds;
+      return true;
+    }
+
+    // Keep light settings created by version 1.0.7 and earlier. The new
+    // pump-duration field falls back to the default until the next save.
+    LegacyRecord legacy;
+    if (!readLegacyRecord(legacy) || !isLegacyValid(legacy)) {
       return false;
     }
 
-    state.lightsOn = record.lightsOn != 0;
-    state.mode = record.mode;
-    state.brightness = record.brightness;
+    state.lightsOn = legacy.lightsOn != 0;
+    state.mode = legacy.mode;
+    state.brightness = legacy.brightness;
+    state.pumpDurationSeconds = MYDOT_VASE_DEFAULT_PUMP_DURATION_SECONDS;
     return true;
   }
 
@@ -89,15 +104,15 @@ public:
     record.lightsOn = state.lightsOn ? 1 : 0;
     record.mode = state.mode;
     record.brightness = state.brightness;
+    record.pumpDurationSeconds = state.pumpDurationSeconds;
     record.checksum = calculateChecksum(record);
     return writeRecord(record);
   }
 
 private:
   static const uint32_t RECORD_MAGIC = 0x4D445653UL;  // "MDVS"
-  // Version 3 invalidates state records created while the slider parser was
-  // returning zero for every compact key_value message.
-  static const uint8_t RECORD_VERSION = 3;
+  // Version 4 adds the persisted pump duration to the state record.
+  static const uint8_t RECORD_VERSION = 4;
 
   struct Record {
     uint32_t magic;
@@ -105,8 +120,20 @@ private:
     uint8_t lightsOn;
     uint8_t mode;
     uint8_t brightness;
+    uint8_t pumpDurationSeconds;
     uint8_t checksum;
   };
+
+  struct LegacyRecord {
+    uint32_t magic;
+    uint8_t version;
+    uint8_t lightsOn;
+    uint8_t mode;
+    uint8_t brightness;
+    uint8_t checksum;
+  };
+
+  static const uint8_t LEGACY_RECORD_VERSION = 3;
 
   bool _started = false;
 
@@ -131,6 +158,21 @@ private:
            record.checksum == calculateChecksum(record);
   }
 
+  static uint8_t calculateLegacyChecksum(const LegacyRecord& record) {
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&record);
+    uint8_t checksum = 0xA5;
+    for (size_t i = 0; i < offsetof(LegacyRecord, checksum); ++i) {
+      checksum ^= bytes[i];
+    }
+    return checksum;
+  }
+
+  static bool isLegacyValid(const LegacyRecord& record) {
+    return record.magic == RECORD_MAGIC &&
+           record.version == LEGACY_RECORD_VERSION &&
+           record.checksum == calculateLegacyChecksum(record);
+  }
+
   bool readRecord(Record& record) {
 #if defined(MYDOT_VASE_STORAGE_PREFERENCES)
     if (_preferences.getBytesLength("lights") != sizeof(Record)) {
@@ -145,6 +187,26 @@ private:
 
 #elif defined(MYDOT_VASE_STORAGE_EEPROM)
     for (size_t i = 0; i < sizeof(Record); ++i) {
+      reinterpret_cast<uint8_t*>(&record)[i] = EEPROM.read(i);
+    }
+    return true;
+#endif
+  }
+
+  bool readLegacyRecord(LegacyRecord& record) {
+#if defined(MYDOT_VASE_STORAGE_PREFERENCES)
+    if (_preferences.getBytesLength("lights") != sizeof(LegacyRecord)) {
+      return false;
+    }
+    return _preferences.getBytes("lights", &record, sizeof(LegacyRecord)) == sizeof(LegacyRecord);
+
+#elif defined(MYDOT_VASE_STORAGE_MBED_KV)
+    size_t actualSize = 0;
+    return kv_get("/kv/mydotvase_lights", &record, sizeof(LegacyRecord), &actualSize) == 0 &&
+           actualSize == sizeof(LegacyRecord);
+
+#elif defined(MYDOT_VASE_STORAGE_EEPROM)
+    for (size_t i = 0; i < sizeof(LegacyRecord); ++i) {
       reinterpret_cast<uint8_t*>(&record)[i] = EEPROM.read(i);
     }
     return true;
