@@ -4,6 +4,10 @@
  * Reads an AZ-Delivery analog soil-moisture sensor on A0 and publishes the
  * reading to the Microeden cloud. The MyDot relay is used as the pump output.
  *
+ * Vase Kit guides:
+ *   English: https://microeden.io/docs/products/my-dot/mydot-vase-kit/manual-vase-kit-en
+ *   Italiano: https://microeden.io/docs/products/my-dot/mydot-vase-kit/manual-vase-kit-it
+ *
  * Cloud commands (the default command key is "content"):
  *   "pump" - turns the pump on for the configured number of seconds
  *   "lights_on" / "lights_off" - switches the NeoPixel lights
