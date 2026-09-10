@@ -282,10 +282,6 @@ Il backend viene scelto automaticamente in base all'architettura:
 - Nano RP2040 Connect con core Mbed: Mbed KVStore;
 - core RP2040 o Nano 33 IoT con supporto EEPROM: EEPROM.
 
-Il record include valore magico, versione e checksum. La versione corrente è la
-4. I record della versione 3 vengono migrati per i campi delle luci e usano la
-durata predefinita di due secondi finché non viene salvato un nuovo valore.
-
 La modifica dello stato luci, della luminosità o dello slider della durata viene
 salvata subito. La telemetria viene ritardata solo brevemente per evitare di
 intasare il cloud mentre uno slider viene trascinato.

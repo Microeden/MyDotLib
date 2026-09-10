@@ -275,10 +275,6 @@ Storage is selected automatically by board architecture:
 - Nano RP2040 Connect with the Mbed core: Mbed KVStore;
 - RP2040 or Nano 33 IoT cores with EEPROM support: EEPROM.
 
-The record includes a magic value, version, and checksum. The current record
-version is 4. Records from version 3 are migrated for the light fields and use
-the default two-second pump duration until a new value is saved.
-
 Changing the light state, brightness, or pump-duration slider saves immediately.
 Telemetry is delayed briefly only to avoid flooding the cloud while a slider is
 being dragged.
