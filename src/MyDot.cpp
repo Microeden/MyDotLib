@@ -4,6 +4,24 @@
 #include "MyDotRootCA.h"
 #endif
 
+// Arduino's common API intentionally does not standardise runtime RAM
+// statistics.  The official Nano RP2040 Connect core is Mbed-based, though,
+// so use its native stats API when that core exposes it.
+#if (defined(ARDUINO_ARCH_MBED) || defined(ARDUINO_NANO_RP2040_CONNECT)) && __has_include(<mbed_stats.h>)
+#include <mbed_stats.h>
+#define MYDOT_HAS_MBED_STATS 1
+#else
+#define MYDOT_HAS_MBED_STATS 0
+#endif
+
+#if MYDOT_HAS_RP2040_STATS
+#include <RP2040.h>
+#endif
+
+#if defined(ARDUINO_ARCH_SAMD)
+extern "C" void* _sbrk(int increment);
+#endif
+
 // PubSubClient uses a C-style callback and cannot carry a MyDot instance.
 // The active object is saved here and used by mqttCallback below.
 MyDot* MyDot::_instance = nullptr;
@@ -24,6 +42,24 @@ void MyDot::mqttCallback(char* topic, byte* payload, unsigned int length) {
     for (JsonPair kv : obj) {
       const char* key = kv.key().c_str();
       if (strcmp(key, "content") == 0) {
+        String command = kv.value().as<String>();
+        command.trim();
+        if (command.length() > 0) {
+          // Keep every non-empty content message. The dashboard worker can
+          // publish an empty reset directly after the command; relying only
+          // on _lastInboundDoc would then lose the command between loops.
+          MyDot* device = _instance;
+          uint8_t slot = (uint8_t)((device->_pendingCommandHead + device->_pendingCommandCount) % MyDot::MAX_PENDING_COMMANDS);
+          if (device->_pendingCommandCount >= MyDot::MAX_PENDING_COMMANDS) {
+            slot = device->_pendingCommandHead;
+            device->_pendingCommandHead = (uint8_t)((device->_pendingCommandHead + 1) % MyDot::MAX_PENDING_COMMANDS);
+          } else {
+            ++device->_pendingCommandCount;
+          }
+          device->_pendingCommandQueue[slot] = command;
+          Serial.print("MyDot: Cloud command received: ");
+          Serial.println(command);
+        }
         const char* val = kv.value().as<const char*>();
         if (val) {
           const char* sep = strchr(val, '_');
@@ -110,7 +146,8 @@ static const unsigned char PROGMEM logo_bmp[] = {
 };
 
 MyDot::MyDot()
-  : display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET),
+  : _currentFanSpeed(0),
+    display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET),
     pixels(NUMPIXELS,
 #if defined(ARDUINO_NANO_ESP32)
            digitalPinToGPIONumber(PIN),
@@ -128,9 +165,75 @@ MyDot::MyDot()
   _instance = this;
 }
 
+bool MyDot::rebootSupported() const {
+#if defined(ARDUINO_ARCH_ESP32) || defined(ARDUINO_ARCH_SAMD) || defined(ARDUINO_ARCH_MBED) || MYDOT_HAS_RP2040_NATIVE_REBOOT
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool MyDot::reboot() {
+#if defined(ARDUINO_ARCH_ESP32)
+  esp_restart();
+  return true;
+#elif defined(ARDUINO_ARCH_SAMD) || defined(ARDUINO_ARCH_MBED)
+  NVIC_SystemReset();
+  return true;
+#elif MYDOT_HAS_RP2040_NATIVE_REBOOT
+  watchdog_reboot(0, 0, 10);
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool MyDot::watchdogBegin(unsigned long timeoutMs) {
+  // Una soglia troppo bassa renderebbe il watchdog inutilizzabile durante
+  // operazioni legittime del Bridge (seriale, SD o TLS).
+  if (timeoutMs < 100 || !rebootSupported()) return false;
+  if (_watchdogEnabled && _watchdogTimeout == timeoutMs) return true;
+  _watchdogTimeout = timeoutMs;
+  _watchdogLastFeed = millis();
+  _watchdogEnabled = true;
+  return true;
+}
+
+void MyDot::watchdogFeed() {
+  if (_watchdogEnabled) _watchdogLastFeed = millis();
+}
+
+void MyDot::watchdogStop() {
+  _watchdogEnabled = false;
+  _watchdogTimeout = 0;
+  _watchdogLastFeed = 0;
+}
+
+bool MyDot::watchdogIsEnabled() const {
+  return _watchdogEnabled;
+}
+
+void MyDot::serviceWatchdog() {
+  if (!_watchdogEnabled || _watchdogTimeout == 0) return;
+  if ((unsigned long)(millis() - _watchdogLastFeed) < _watchdogTimeout) return;
+  _watchdogEnabled = false;
+  Serial.println("MyDot: watchdog timeout; rebooting.");
+  Serial.flush();
+  delay(20);
+  if (!reboot()) Serial.println("MyDot: watchdog reboot is not available on this board.");
+}
+
 // --- Wi-Fi and cloud setup ---
 
 void MyDot::beginWiFi(const char* ssid, const char* password) {
+#if !MYDOT_HAS_WIFI
+  (void)ssid;
+  (void)password;
+  _wifiStarted = false;
+  _timeConfigured = false;
+  Serial.println("MyDot: Wi-Fi is not available on this board.");
+  return;
+#else
   // Save credentials for the automatic reconnect logic in run().
   strncpy(_ssid, ssid, sizeof(_ssid) - 1);
   _ssid[sizeof(_ssid) - 1] = '\0';
@@ -148,14 +251,10 @@ void MyDot::beginWiFi(const char* ssid, const char* password) {
     showDisplay();
   }
   WiFi.begin(ssid, password);
-  // Give simple sketches a chance to start online, but never block setup
-  // forever when the access point is unavailable.  run() continues the same
-  // connection attempt and retries it later without blocking the application.
-  const unsigned long WIFI_INITIAL_TIMEOUT = 15000;
-  unsigned long startedAt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < WIFI_INITIAL_TIMEOUT) {
-    delay(100);
-  }
+  // La connessione viene sempre gestita da run(). Non attendere qui il
+  // completamento dell'handshake: beginWiFi() può essere chiamato dal
+  // programma runtime mentre il canale USB deve restare pronto a ricevere
+  // STOP, STATUS e altri comandi di controllo.
   if (WiFi.status() == WL_CONNECTED) {
     if (displayPresent) {
       showDisplay();
@@ -166,13 +265,34 @@ void MyDot::beginWiFi(const char* ssid, const char* password) {
     _timeConfigured = true;
 #endif
   } else {
-    Serial.println("MyDot: Wi-Fi connection timed out; retrying in run().");
+    Serial.println("MyDot: Wi-Fi connection started; run() will continue it asynchronously.");
   }
+#endif
 }
 
 void MyDot::beginCloud(const char* deviceId, const char* token) {
-  _deviceId = String(deviceId);
-  _token = token;
+#if !MYDOT_HAS_CLOUD
+  (void)deviceId;
+  (void)token;
+  _cloudConfigured = false;
+  Serial.println("MyDot: My Microeden cloud is not available on this board.");
+  return;
+#else
+  const String nextDeviceId = String(deviceId ? deviceId : "");
+  const String nextToken = String(token ? token : "");
+  // CLOUD BEGIN is often placed in the continuous flow. Re-running the same
+  // setup command must not flush commands that arrived between two loop
+  // iterations or restart the MQTT back-off timer on every pass.
+  if (_cloudConfigured && _deviceId == nextDeviceId && _token == nextToken) {
+    return;
+  }
+  _deviceId = nextDeviceId;
+  _token = nextToken;
+  _pendingCommandHead = 0;
+  _pendingCommandCount = 0;
+  for (uint8_t index = 0; index < MAX_PENDING_COMMANDS; ++index) {
+    _pendingCommandQueue[index] = String();
+  }
 
   _clientId = "MICROEDEN-MYDEVICE-" + _deviceId;
   _topicIn = "microeden/dot/" + _deviceId + "/inbox";
@@ -186,11 +306,47 @@ void MyDot::beginCloud(const char* deviceId, const char* token) {
   _mqtt.setServer("microeden.io", 8243);
   _mqtt.setCallback(mqttCallback);
   _mqtt.setKeepAlive(60);
-  _mqtt.setSocketTimeout(5);
+  // Un timeout breve evita che una connessione TCP/MQTT irraggiungibile
+  // monopolizzi il loop e ritardi il canale USB di controllo.
+  _mqtt.setSocketTimeout(2);
   _mqtt.setBufferSize(1024);
   _cloudConfigured = true;
   _lastMqttAttempt = 0;
   _mqttFailureCount = 0;
+#endif
+}
+
+void MyDot::stopNetworkServices() {
+  // Stop the MQTT client first so no callback can enqueue a command while the
+  // Wi-Fi station is being taken down. Clearing the configuration flags keeps
+  // run() from reconnecting the services after this explicit shutdown.
+  _mqtt.disconnect();
+  _cloudConfigured = false;
+  _syncCallback = nullptr;
+  _lastMqttAttempt = 0;
+  _mqttFailureCount = 0;
+  _pendingCommandHead = 0;
+  _pendingCommandCount = 0;
+  for (uint8_t index = 0; index < MAX_PENDING_COMMANDS; ++index) {
+    _pendingCommandQueue[index] = String();
+  }
+  _payloadDoc.clear();
+  _lastInboundDoc.clear();
+  _stateDoc.clear();
+  _pendingWidgetDoc.clear();
+
+  _wifiStarted = false;
+  _timeConfigured = false;
+  _wifiRestartPending = false;
+  _lastWiFiAttempt = 0;
+  _wifiRestartAt = 0;
+#if MYDOT_HAS_WIFI && defined(ARDUINO_ARCH_ESP32)
+  // On ESP32 the optional argument also powers down the station radio. It
+  // does not erase the credentials saved by beginWiFi().
+  WiFi.disconnect(true);
+#elif MYDOT_HAS_WIFI
+  WiFi.disconnect();
+#endif
 }
 
 void MyDot::setCloudBufferSize(uint16_t size) {
@@ -203,6 +359,12 @@ void MyDot::setCloudSync(unsigned long interval, CloudSyncCallback callback) {
 }
 
 void MyDot::run() {
+  serviceWatchdog();
+#if !MYDOT_HAS_WIFI
+  // Peripheral-only boards still share the same runtime and serial Bridge;
+  // there simply is no network state machine to service.
+  return;
+#else
   unsigned long now = millis();
 
   // run() is also used by peripheral-only sketches.  Do not touch the Wi-Fi
@@ -320,33 +482,81 @@ void MyDot::run() {
   if (now - lastReadTime >= READ_INTERVAL) {
     lastReadTime = now;
   }
+#endif
+}
+
+bool MyDot::isWiFiConnected() {
+#if !MYDOT_HAS_WIFI
+  return false;
+#else
+  return WiFi.status() == WL_CONNECTED;
+#endif
 }
 
 // --- Cloud send and receive ---
 
 bool MyDot::sendCloud() {
+#if !MYDOT_HAS_CLOUD
+  return false;
+#else
   if (_mqtt.connected()) {
-    // Serialize all values accumulated through writeKeyWord(), then clear the
-    // outgoing document so the next publication starts with an empty payload.
+    // Serialize all values accumulated through writeKeyWord(). On success the
+    // outgoing document is cleared so the next publication starts empty.
     String output;
     serializeJson(_payloadDoc, output);
     bool success = _mqtt.publish(_topicOut.c_str(), output.c_str());
-    _payloadDoc.clear();
+    // Keep the pending payload when MQTT rejects the publication. The next
+    // reconnect can retry it instead of silently losing telemetry.
+    if (success) _payloadDoc.clear();
     return success;
   }
   return false;
+#endif
 }
 
 bool MyDot::isCloudConnected() {
+#if !MYDOT_HAS_CLOUD
+  return false;
+#else
   return _mqtt.connected();
+#endif
 }
 
 bool MyDot::onCommand(const char* expectedCmd, const char* key) {
-  if (!_lastInboundDoc[key].isNull()) {
-    String currentCmd = _lastInboundDoc[key].as<String>();
-    if (currentCmd == expectedCmd) {
+  const char* commandKey = (key && *key) ? key : "content";
+  String expected = expectedCmd ? String(expectedCmd) : String();
+  expected.trim();
+
+  // Content commands are consumed from the FIFO first. This also handles a
+  // command/reset pair published in the same MQTT cycle.
+  if (strcmp(commandKey, "content") == 0 && expected.length() > 0) {
+    for (uint8_t offset = 0; offset < _pendingCommandCount; ++offset) {
+      const uint8_t slot = (uint8_t)((_pendingCommandHead + offset) % MAX_PENDING_COMMANDS);
+      String current = _pendingCommandQueue[slot];
+      current.trim();
+      if (!current.equalsIgnoreCase(expected)) continue;
+      for (uint8_t shift = offset; shift + 1 < _pendingCommandCount; ++shift) {
+        const uint8_t from = (uint8_t)((_pendingCommandHead + shift + 1) % MAX_PENDING_COMMANDS);
+        const uint8_t to = (uint8_t)((_pendingCommandHead + shift) % MAX_PENDING_COMMANDS);
+        _pendingCommandQueue[to] = _pendingCommandQueue[from];
+      }
+      const uint8_t tail = (uint8_t)((_pendingCommandHead + _pendingCommandCount - 1) % MAX_PENDING_COMMANDS);
+      _pendingCommandQueue[tail] = String();
+      --_pendingCommandCount;
+      _lastInboundDoc.remove(commandKey);
+      return true;
+    }
+  }
+
+  if (!_lastInboundDoc[commandKey].isNull()) {
+    String currentCmd = _lastInboundDoc[commandKey].as<String>();
+    currentCmd.trim();
+    // I widget pubblicano identificatori di comando; il confronto non deve
+    // fallire per differenze di maiuscole/minuscole o spazi accidentali nel
+    // payload MQTT.
+    if (expected.length() > 0 && currentCmd.equalsIgnoreCase(expected)) {
       // Consume a command after matching so it is delivered only once.
-      _lastInboundDoc.remove(key);
+      _lastInboundDoc.remove(commandKey);
       return true;
     }
   }
@@ -461,6 +671,18 @@ bool MyDot::isButtonBClicked() {
   return false;
 }
 
+bool MyDot::peekButtonAClicked() {
+  const bool currentState = isButtonAPressed();
+  return currentState && !_lastButtonAState &&
+         (millis() - _lastPressTimeA > 50);
+}
+
+bool MyDot::peekButtonBClicked() {
+  const bool currentState = isButtonBPressed();
+  return currentState && !_lastButtonBState &&
+         (millis() - _lastPressTimeB > 50);
+}
+
 void MyDot::setRelay(bool state) {
   digitalWrite(RELAY, state ? HIGH : LOW);
   delay(10);
@@ -471,6 +693,10 @@ void MyDot::toggleRelay() {
   digitalWrite(RELAY, !digitalRead(RELAY));
   delay(10);
   pixels.show();
+}
+
+bool MyDot::isRelayOn() {
+  return digitalRead(RELAY) == HIGH;
 }
 
 // --- NeoPixels ---
@@ -579,6 +805,30 @@ void MyDot::displayPrint(const String& text, int x, int y, uint8_t size, bool cl
   display.display();
 }
 
+void MyDot::updateSensorDisplay() {
+  if (!displayPresent || !readSensors()) {
+    return;
+  }
+
+  clearDisplay();
+  setCursor(0, 0);
+  setTextSize(1);
+  setTextColor(SSD1306_WHITE);
+  print("T: ");
+  print(getTemperature());
+  println(" C");
+  print("P: ");
+  print(getPressure());
+  println(" hPa");
+  print("H: ");
+  print(getHumidity());
+  println(" %");
+  print("G: ");
+  print(getGasResistance());
+  println(" kOhm");
+  showDisplay();
+}
+
 // --- BME690 sensor ---
 
 bool MyDot::readSensors() {
@@ -620,6 +870,101 @@ bool MyDot::beginSD() {
   return true;
 }
 
+namespace {
+
+// Each board family owns its memory API here.  The rest of the library never
+// calls ESP.get*(), mbed_stats, or _sbrk() directly, so a missing core API can
+// only disable the adapter instead of breaking compilation for another Nano.
+bool readEsp32RamStats(uint32_t& freeBytes, uint32_t& totalBytes) {
+#if defined(ARDUINO_ARCH_ESP32)
+  totalBytes = (uint32_t)ESP.getHeapSize();
+  freeBytes = (uint32_t)ESP.getFreeHeap();
+  return totalBytes > 0;
+#else
+  (void)freeBytes;
+  (void)totalBytes;
+  return false;
+#endif
+}
+
+bool readMbedRamStats(uint32_t& freeBytes, uint32_t& totalBytes) {
+#if MYDOT_HAS_MBED_STATS
+  mbed_stats_sys_t systemStats = {};
+  mbed_stats_heap_t heapStats = {};
+  mbed_stats_sys_get(&systemStats);
+  mbed_stats_heap_get(&heapStats);
+  for (size_t index = 0; index < MBED_MAX_MEM_REGIONS; ++index) {
+    totalBytes += systemStats.ram_size[index];
+  }
+  if (totalBytes == 0 || heapStats.reserved_size == 0) {
+    freeBytes = 0;
+    totalBytes = 0;
+    return false;
+  }
+  const uint32_t usedHeap = heapStats.current_size + heapStats.overhead_size;
+  freeBytes = totalBytes > usedHeap ? totalBytes - usedHeap : 0;
+  return true;
+#else
+  (void)freeBytes;
+  (void)totalBytes;
+  return false;
+#endif
+}
+
+bool readSamdRamStats(uint32_t& freeBytes, uint32_t& totalBytes) {
+#if defined(ARDUINO_SAMD_NANO_33_IOT)
+  // The SAMD21G18A used by Nano 33 IoT has 32 KiB SRAM. The SAMD Arduino
+  // core exposes the newlib heap break; comparing it with the stack marker
+  // gives the currently usable gap without inventing a heap API.
+  char stackMarker;
+  char* heapEnd = static_cast<char*>(_sbrk(0));
+  const intptr_t gap = &stackMarker - heapEnd;
+  totalBytes = 32UL * 1024UL;
+  freeBytes = gap > 0 ? static_cast<uint32_t>(gap) : 0;
+  return gap > 0;
+#else
+  (void)freeBytes;
+  (void)totalBytes;
+  return false;
+#endif
+}
+
+bool readRp2040RamStats(uint32_t& freeBytes, uint32_t& totalBytes) {
+#if MYDOT_HAS_RP2040_STATS
+  const int total = rp2040.getTotalHeap();
+  const int free = rp2040.getFreeHeap();
+  if (total <= 0 || free < 0) return false;
+  totalBytes = static_cast<uint32_t>(total);
+  freeBytes = static_cast<uint32_t>(free > total ? total : free);
+  return true;
+#else
+  (void)freeBytes;
+  (void)totalBytes;
+  return false;
+#endif
+}
+
+}  // namespace
+
+bool MyDot::getMemoryStats(uint32_t& freeBytes, uint32_t& totalBytes) const {
+  freeBytes = 0;
+  totalBytes = 0;
+
+#if MYDOT_HAS_RAM_STATUS
+#if defined(ARDUINO_ARCH_ESP32)
+  return readEsp32RamStats(freeBytes, totalBytes);
+#elif defined(ARDUINO_ARCH_MBED) || defined(ARDUINO_NANO_RP2040_CONNECT)
+  return readMbedRamStats(freeBytes, totalBytes);
+#elif defined(ARDUINO_SAMD_NANO_33_IOT)
+  return readSamdRamStats(freeBytes, totalBytes);
+#elif defined(ARDUINO_ARCH_RP2040)
+  return readRp2040RamStats(freeBytes, totalBytes);
+#endif
+#endif
+
+  return false;
+}
+
 File MyDot::openFile(const char* filename, const char* mode) {
 #if defined(ARDUINO_ARCH_ESP32)
   return SD.open(filename, mode);
@@ -643,7 +988,41 @@ bool MyDot::fileExists(const char* filename) {
   return SD.exists(filename);
 }
 
+bool MyDot::makeDirectory(const String& path) {
+  if (path.length() == 0) {
+    return false;
+  }
+  return SD.mkdir(path.c_str());
+}
+
+bool MyDot::createFile(const String& path) {
+  if (path.length() == 0 || SD.exists(path)) {
+    return false;
+  }
+  File file = SD.open(path, FILE_WRITE);
+  if (!file) {
+    return false;
+  }
+  file.close();
+  return true;
+}
+
 void MyDot::removeFile(const char* filename) {
+  if (filename == nullptr || filename[0] == '\0') {
+    return;
+  }
+  // SD.remove() vale per i file e rifiuta le directory. Riconosciamo quindi
+  // il tipo di voce prima della rimozione, così il Bridge può cancellare una
+  // cartella vuota tramite l'operazione rmdir() prevista dalla libreria SD.
+  File entry = SD.open(filename);
+  if (entry) {
+    const bool directory = entry.isDirectory();
+    entry.close();
+    if (directory) {
+      SD.rmdir(filename);
+      return;
+    }
+  }
   SD.remove(filename);
 }
 
@@ -706,6 +1085,7 @@ void MyDot::stopFan() {
   Wire.write(0x00);
   Wire.write(0x03);
   Wire.endTransmission();
+  _currentFanSpeed = 0;
 }
 
 uint8_t MyDot::getFanFault() {
@@ -729,13 +1109,20 @@ void MyDot::clearFanFault() {
 
 
 long MyDot::getWiFiRSSI() {
+#if !MYDOT_HAS_WIFI
+  return 0;
+#else
   if (WiFi.status() == WL_CONNECTED) {
     return WiFi.RSSI();
   }
   return 0;
+#endif
 }
 
 unsigned long MyDot::getEpochTime() {
+#if !MYDOT_HAS_WIFI
+  return 0;
+#else
   if (WiFi.status() != WL_CONNECTED) return 0;
 
 #if defined(ARDUINO_ARCH_ESP32)
@@ -744,6 +1131,7 @@ unsigned long MyDot::getEpochTime() {
   return (unsigned long)now;
 #else
   return WiFi.getTime();
+#endif
 #endif
 }
 

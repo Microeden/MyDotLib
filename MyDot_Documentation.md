@@ -1,5 +1,7 @@
 # MyDot library documentation
 
+Italian translation: [MyDot_Documentation_IT.md](MyDot_Documentation_IT.md).
+
 ## Overview
 
 MyDot is an Arduino library for the Microeden MyDot carrier and the Microeden cloud platform. It provides one API for the board peripherals and for optional Wi-Fi/MQTT communication:
@@ -21,7 +23,10 @@ The carrier should be powered through its external DC jack when using the relay,
 
 The onboard environmental sensor is a BME690. The library uses the compatible Adafruit BME680 driver interface for initialization and readings.
 
-The declared architectures are ESP32, SAMD, RP2040, and Mbed Nano Wi-Fi boards. The Nano ESP32 mapping is documented below; other boards use the compile-time pin definitions in `MyDot.h` and may require a carrier-specific wiring check.
+The declared architectures are ESP32, SAMD, RP2040, and Mbed Nano Wi-Fi boards.
+All supported Arduino Nano boards use the same physical Nano header on the
+MyDot carrier. The compile-time definitions in `MyDot.h` adapt the common
+header aliases to each core; they do not describe different carrier wiring.
 
 For an Arduino Nano ESP32, select **Arduino Nano ESP32** in the Arduino IDE. The library supports either the board's Arduino pin numbering or **By GPIO number (legacy)** setting. MyDot translates the Nano ESP32 `D3` LED alias to the physical ESP32 GPIO before initializing the NeoPixel driver.
 
@@ -99,13 +104,24 @@ void loop() {
 }
 ```
 
-`beginWiFi()` starts the connection and waits for up to 15 seconds during setup. If the access point is unavailable, setup continues and `run()` retries in the background. Do not call `beginWiFi()` repeatedly from `loop()`.
+`beginWiFi()` starts the connection asynchronously and does not block setup while
+waiting for the access point. If the access point is unavailable, `run()` retries
+in the background. Do not call `beginWiFi()` repeatedly from `loop()`.
+
+#### `void stopNetworkServices()`
+
+Disconnects the MQTT client and Wi-Fi station, clears pending cloud messages
+and the synchronization callback, and disables automatic reconnection in
+`run()`. Call it when an interactive programming session is finished. It does
+not erase the stored credentials; a later `beginWiFi()` followed by
+`beginCloud()` can start the services again.
 
 ## Board pin mapping
 
-The following aliases are used by the library on the MyDot carrier:
+The following aliases are used by the library on the MyDot carrier for every
+supported Arduino Nano:
 
-| Function | Arduino Nano ESP32 alias |
+| Function | Standard Nano header alias |
 | --- | --- |
 | Button A | `A7` |
 | Button B | `D4` |
@@ -143,6 +159,7 @@ Every example is self-contained and includes its own `microeden_secrets.h` place
 | `ColorConversion` | RGB and hexadecimal color conversion |
 | `HardwareCheck` | Automatic relay and NeoPixel checks plus pin diagnostics |
 | `MyDotVase` | Analog soil telemetry, pump commands, cool/warm/grow NeoPixel modes, local buttons, and cloud brightness |
+| `MyDotDevStudioBridge` | Serial editor bridge, complete API command surface, encrypted microSD runtime sequences, and non-blocking playback |
 
 `MyDotVase` reads the analog sensor from `A0` and publishes `soilRaw`, `soilPercent`, `pumpOn`, `pumpActivations`, `lightsOn`, `lightMode`, `lightModeIndex`, `brightness`, and `event`. It uses the `Slider`, `Switch`, and `Level` widget helpers for the `brightness`, `pumpOn`, `lightsOn`, and `lightModeIndex` keys. Pump commands are `on`, `off`, and `pump`; each explicit pump command publishes the current `pumpOn` state. Light commands are `lights_on`, `lights_off`, `lights_warm`, `lights_cool`, `grow_veg`, `grow_bloom`, and `grow_full`. A numeric mode can also be selected with `{"content":"lights_mode", "mode":2}`; the modes are cool white (`0`), warm white (`1`), vegetative grow (`2`), bloom grow (`3`), and full-spectrum grow (`4`). The cloud slider must use the key `brightness` and sends the compact `key_value` form, for example `{"content":"brightness_128"}`; the example reads the parsed value from the `Slider` state and applies the range 0–255. Slider changes are applied immediately, while cloud publication and persistent storage wait 300 ms for the slider to settle. Button A toggles the lights locally and button B cycles through all five modes. The grow colors are NeoPixel approximations, not calibrated horticultural spectra. Adjust `SOIL_RAW_DRY` and `SOIL_RAW_WET` in the sketch after measuring the actual sensor in dry and wet soil. The example assumes that the pump is driven through the MyDot relay and that the carrier is powered through its external DC jack.
 
@@ -181,7 +198,24 @@ The following constants are available from `MyDot.h`:
 | `OLED_RESET` | `-1` | OLED reset pin configuration |
 | `NUMPIXELS` | `12` | Number of NeoPixels on the carrier |
 
-The pin macros `BUTTON_A`, `BUTTON_B`, `RELAY`, `PIN`, and `SD_CS` are selected at compile time for the target board. Use the board mapping above when wiring application hardware.
+The pin macros `BUTTON_A`, `BUTTON_B`, `RELAY`, `PIN`, and `SD_CS` are selected
+at compile time only to accommodate the target core's numbering rules. The
+carrier wiring remains the standard Nano mapping shown above.
+
+### Platform capabilities
+
+The library exposes a board-safe capability matrix through the `MYDOT_HAS_*`
+compile-time flags and the Bridge `CAPS` response:
+
+- `MYDOT_HAS_WIFI`: Wi-Fi transport is available;
+- `MYDOT_HAS_CLOUD`: My Microeden/MQTT transport is available;
+- `MYDOT_HAS_RAM_STATUS`: a runtime RAM adapter is available;
+- `MYDOT_HAS_SD_CAPACITY`: SD capacity/free-space reporting is available.
+
+RAM reporting is selected by a dedicated adapter for ESP32, SAMD, RP2040 and
+Mbed cores. Boards without the corresponding native API report `unknown` and
+continue compiling; they do not receive an invented value. The Bridge filters
+network, cloud and storage commands from `CAPS` according to these flags.
 
 ## API reference
 
@@ -207,6 +241,27 @@ The OLED logo is drawn when the display is present. NeoPixels are cleared during
 #### `void run()`
 
 Services the library. When cloud features are configured, it handles Wi-Fi reconnection, MQTT reconnection, MQTT traffic, and the optional periodic cloud callback. Call it as often as possible from `loop()` and avoid long blocking delays.
+
+#### `bool reboot()` and `bool rebootSupported() const`
+
+`reboot()` requests a native software reset on ESP32, SAMD, Mbed and RP2040
+cores where the Arduino platform exposes a safe primitive. It returns `false`
+only on an unsupported core. The method does not return after a successful
+reset. `rebootSupported()` can be used to hide a restart control when the core
+does not provide one.
+
+#### Cooperative watchdog API
+
+```cpp
+dot.watchdogBegin(10000);  // timeout in milliseconds
+dot.watchdogFeed();        // call from the healthy loop
+dot.watchdogStop();
+```
+
+The watchdog is portable and cooperative: `run()` checks the deadline and
+calls `reboot()` when the application has not fed it in time. No automatic feed
+is performed, so a stalled loop can be detected. `watchdogBegin()` rejects
+timeouts below 100 ms; `watchdogIsEnabled()` reports the current state.
 
 ### Fan and DRV8830 motor driver
 
@@ -259,7 +314,8 @@ Returns the speed value most recently requested through `setFanSpeed()`. It is t
 
 #### `void beginWiFi(const char* ssid, const char* password)`
 
-Starts the Wi-Fi connection using the supplied credentials and waits for up to 15 seconds for `WL_CONNECTED`. On ESP32 it also configures NTP servers (`pool.ntp.org` and `time.nist.gov`).
+Starts the Wi-Fi connection asynchronously using the supplied credentials. On
+ESP32 it also configures NTP servers (`pool.ntp.org` and `time.nist.gov`).
 
 If the initial connection fails, the method returns instead of blocking forever. Call `run()` continuously from `loop()`; it disconnects a stale MQTT session, retries Wi-Fi every 10 seconds, and reconnects MQTT every 5 seconds after Wi-Fi is restored. If Wi-Fi still reports connected but three consecutive MQTT attempts fail, the library restarts the Wi-Fi station as well. Call this method once from `setup()` rather than from `loop()`.
 
@@ -349,7 +405,7 @@ Call `sendCloud()` after adding the values you want to publish.
 
 #### `bool onCommand(const char* expectedCmd, const char* key = "content")`
 
-Checks the latest inbound cloud document. It returns `true` when the value stored under `key` matches `expectedCmd`, and consumes that matching command so it is not reported repeatedly.
+Checks the inbound cloud command queue (the default key is `content`). It returns `true` when a queued value matches `expectedCmd`, ignoring case and surrounding whitespace, and consumes that matching command so it is not reported repeatedly. Empty reset messages do not discard commands already received.
 
 #### `template <typename T> T readKeyWord(const char* key = "content")`
 
@@ -413,6 +469,11 @@ Sets the relay state. `true` energizes the relay; `false` de-energizes it.
 
 Inverts the current relay output state.
 
+#### `bool isRelayOn()`
+
+Returns `true` when the relay output is currently energized, or `false` when
+it is de-energized. Reading the state does not change the output.
+
 ```cpp
 if (dot.isButtonAClicked()) {
   dot.toggleRelay();
@@ -464,7 +525,9 @@ Draws the MyDot logo on the display buffer and sends it to the OLED.
 
 #### `void updateSensorDisplay()`
 
-Public compatibility declaration for refreshing a sensor display. The current library source does not provide an implementation for this entry point; application code should call `readSensors()` and then use the display primitives below to render values explicitly.
+Reads the onboard BME690 and refreshes the OLED with temperature, pressure,
+humidity and gas-resistance values. The method returns without drawing when the
+display is not present or a sensor reading fails.
 
 #### `void clearDisplay()`
 
@@ -559,7 +622,7 @@ if (dot.readSensors()) {
 
 ### SD card
 
-The SD card chip-select pin is `SD_CS` (`D10` on the Nano ESP32 mapping).
+The SD card chip-select pin is `SD_CS` (`D10` on the standard Nano header).
 
 #### `bool beginSD()`
 

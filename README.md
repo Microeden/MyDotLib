@@ -1,5 +1,7 @@
 # MyDot
 
+Documentation: [English](MyDot_Documentation.md) · [Italiano](MyDot_Documentation_IT.md)
+
 Arduino library for the Microeden MyDot board and the Microeden cloud platform.
 
 ## Installation
@@ -23,19 +25,26 @@ examples. Never commit real credentials.
 
 The examples cover board initialization, buttons, relay, pixels, display, sensors,
 fan, SD card, Wi-Fi signal, time, cloud publishing, widgets, commands, and color
-conversion. Each sketch focuses on one library capability.
+conversion. **MyDotDevStudioBridge** additionally exposes the complete API over a
+newline-delimited serial protocol and can save encrypted runtime sequences to
+microSD for the Dev Studio web editor, including generic I²C primitives that can
+be wrapped by dedicated sensor blocks. Each sketch focuses on one library capability.
+The complete bridge protocol is documented in
+[`examples/MyDotDevStudioBridge/COMMANDS.md`](examples/MyDotDevStudioBridge/COMMANDS.md).
+An Italian translation is available in
+[`examples/MyDotDevStudioBridge/COMMANDS_IT.md`](examples/MyDotDevStudioBridge/COMMANDS_IT.md).
 Use **HardwareCheck** to verify the relay and NeoPixels automatically and print
 the pin values selected at compile time.
 Diagnostic examples use the Serial Monitor at 115200 baud; **Display** demonstrates OLED output.
 
 ## Supported boards and pin mapping
 
-The library supports ESP32, SAMD, RP2040, and Mbed Nano Wi-Fi boards. For an **Arduino Nano
-ESP32** with the MyDot shield, it uses the board
-aliases from the MyDot pinout: `A7` (button A), `D4` (button B), `D2` (relay),
-`D3` (LEDs), and `D10` (SD card). This works with either Arduino pin numbering
-or **By GPIO number (legacy)** selected in the Arduino IDE. For NeoPixels, MyDot
-converts `D3` to its physical ESP32 GPIO before initializing the ESP32 LED driver.
+The library supports ESP32, SAMD, RP2040, and Mbed Nano Wi-Fi boards. The MyDot
+carrier uses the standard Nano header on every supported Nano, so its signals
+are always `A7` (button A), `D4` (button B), `D2` (relay), `D3` (LEDs), and
+`D10` (SD card). On the Nano ESP32 these aliases also work with either Arduino
+pin numbering or **By GPIO number (legacy)** selected in the Arduino IDE; MyDot
+converts `D3` to its physical ESP32 GPIO before initializing the LED driver.
 
 ## ESP32 TLS
 
@@ -44,6 +53,13 @@ certificate on ESP32. It does not use insecure TLS. `beginWiFi()` configures NTP
 ESP32, so call it before `beginCloud()` and keep calling `dot.run()` in `loop()`.
 If Wi-Fi drops, `run()` disconnects the stale MQTT session and retries Wi-Fi and
 MQTT automatically.
+
+Call `stopNetworkServices()` when an interactive editor session must release
+its Wi-Fi and MQTT resources. It clears the cloud callback and prevents
+`run()` from reconnecting until the program calls `beginWiFi()`/`beginCloud()`
+again. The Dev Studio Bridge exposes this operation as `EXEC NETWORK STOP`;
+the ordinary `STOP` command intentionally only stops the resident sequence so
+autonomous runtime behaviour is unchanged.
 
 ## Carrier power
 

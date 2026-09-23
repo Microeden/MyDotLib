@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.9
+
+- Added the MyDot Dev Studio Bridge with serial command execution, variables,
+  control flow, generic I²C transactions, SD file operations, and encrypted
+  `/MyDot.run` runtime persistence.
+- Saved runtimes now load and start automatically after a power cycle; `LOAD`,
+  `RUN`, and `STOP` remain available for manual control.
+- Added portable reboot/watchdog, network shutdown, memory diagnostics, SD
+  directory/file helpers, relay state and non-consuming button diagnostics.
+- Added complete English and Italian documentation for the library and Bridge.
+
 ## 1.0.5
 
 - Added automatic Wi-Fi and MQTT reconnection with stale-session recovery.
