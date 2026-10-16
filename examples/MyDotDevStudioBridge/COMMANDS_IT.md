@@ -508,8 +508,8 @@ WIDGET WRITE <type> <key> <value...>
 | `RAW` / `TEXT` | Testo memorizzato | Testo arbitrario |
 | `COLOR` | Tripla RGB | `red green blue` |
 | `MAP` | Coordinate memorizzate | `latitude longitude` oppure `TEXT <value>` |
-| `LEVEL` | Intero | Intero |
-| `SLIDER` | Intero appena ricevuto (`-1` se vuoto) | Intero |
+| `LEVEL` | Intero | Valore numerico, anche decimale |
+| `SLIDER` | Intero appena ricevuto (`-1` se vuoto) | Valore numerico, anche decimale |
 | `SWITCH` | Booleano | `TRUE`/`FALSE` |
 | `PUSHBUTTON` | Booleano | `TRUE`/`FALSE` |
 | `LED` | Booleano | `TRUE`/`FALSE` |
@@ -520,9 +520,25 @@ Esempi:
 ```text
 EXEC WIDGET WRITE COLOR light 255 0 0
 EXEC WIDGET WRITE SLIDER brightness 128
+EXEC WIDGET WRITE LEVEL temperature 21.95
 EXEC WIDGET READ SLIDER brightness
 EXEC WIDGET READ MAP location
 ```
+
+Le scritture `LEVEL` e `SLIDER` accettano sia interi sia numeri decimali. Il
+bridge li pubblica come numeri JSON, quindi il valore prodotto da `SENSOR_READ`
+(per esempio `21.95`) può essere inviato direttamente al widget:
+
+```text
+ADD SENSOR_READ TEMPERATURE TEMP
+ADD WIDGET WRITE LEVEL temperature $TEMP
+SAVE
+RUN
+```
+
+Gli helper tipizzati `Level` e `Slider` continuano a esporre valori interi
+quando leggono gli input della dashboard; il supporto ai decimali riguarda i
+valori scritti dai blocchi runtime.
 
 ## Conversione colori
 

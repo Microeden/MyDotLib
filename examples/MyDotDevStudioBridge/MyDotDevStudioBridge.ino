@@ -96,6 +96,7 @@
 
 #include <MyDot.h>
 #include <Wire.h>
+#include <math.h>
 #include "microeden_secrets.h"
 
 #if !defined(ARDUINO_ARCH_ESP32)
@@ -689,6 +690,24 @@ bool parseIntToken(String& text, int& value) {
     return false;
   }
   value = (int)parsed;
+  return true;
+}
+
+// LEVEL e SLIDER possono ricevere un numero prodotto da un sensore (per
+// esempio 21.95 °C). Manteniamo parseIntToken rigorosa per pin, tempi, colori
+// e altri parametri che richiedono davvero un intero.
+bool parseWidgetNumberToken(String& text, double& value) {
+  String token = takeToken(text);
+  token = expandRuntimeVariables(token);
+  if (token.length() == 0) {
+    return false;
+  }
+  char* end = nullptr;
+  double parsed = strtod(token.c_str(), &end);
+  if (end == token.c_str() || *end != '\0' || !isfinite(parsed)) {
+    return false;
+  }
+  value = parsed;
   return true;
 }
 
@@ -1913,18 +1932,15 @@ bool executeWidgetCommand(String rest) {
       widget.write(latitudeValue, longitudeValue);
     }
   } else if (type == "LEVEL" || type == "SLIDER") {
-    int value = 0;
-    if (!parseIntToken(rest, value) || rest.length() > 0) {
-      Serial.println(F("ERR WIDGET expected-integer-value"));
+    double value = 0;
+    if (!parseWidgetNumberToken(rest, value) || rest.length() > 0) {
+      Serial.println(F("ERR WIDGET expected-numeric-value"));
       return false;
     }
-    if (type == "LEVEL") {
-      Level widget(key.c_str(), dot);
-      widget.write(value);
-    } else {
-      Slider widget(key.c_str(), dot);
-      widget.write(value);
-    }
+    // The public Level/Slider helpers are intentionally integer-typed for
+    // values read from the dashboard. Runtime blocks can also forward sensor
+    // values such as 21.95, so publish the numeric JSON value directly here.
+    dot.writeKeyWord(key.c_str(), value);
   } else if (type == "SWITCH" || type == "PUSHBUTTON" || type == "LED") {
     bool value = false;
     if (!parseBooleanToken(takeToken(rest), value) || rest.length() > 0) {

@@ -523,8 +523,8 @@ Supported types and values:
 | `RAW` / `TEXT` | Cached text | Arbitrary text |
 | `COLOR` | RGB triplet | `red green blue` |
 | `MAP` | Cached coordinate text | `latitude longitude` or `TEXT <value>` |
-| `LEVEL` | Integer | Integer |
-| `SLIDER` | Newly received integer (`-1` when empty) | Integer |
+| `LEVEL` | Integer | Numeric value, including decimals |
+| `SLIDER` | Newly received integer (`-1` when empty) | Numeric value, including decimals |
 | `SWITCH` | Boolean | `TRUE`/`FALSE` |
 | `PUSHBUTTON` | Boolean | `TRUE`/`FALSE` |
 | `LED` | Boolean | `TRUE`/`FALSE` |
@@ -535,9 +535,25 @@ Examples:
 ```text
 EXEC WIDGET WRITE COLOR light 255 0 0
 EXEC WIDGET WRITE SLIDER brightness 128
+EXEC WIDGET WRITE LEVEL temperature 21.95
 EXEC WIDGET READ SLIDER brightness
 EXEC WIDGET READ MAP location
 ```
+
+`LEVEL` and `SLIDER` writes accept both integers and decimal values. The
+bridge publishes them as a JSON number, so a value produced by
+`SENSOR_READ` (for example `21.95`) can be sent directly to a widget:
+
+```text
+ADD SENSOR_READ TEMPERATURE TEMP
+ADD WIDGET WRITE LEVEL temperature $TEMP
+SAVE
+RUN
+```
+
+The typed `Level` and `Slider` read helpers still expose integer values when
+reading dashboard input; decimal support applies to values written by runtime
+blocks.
 
 ## Color conversion
 

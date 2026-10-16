@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.10
+
+- Allow Dev Studio Bridge `LEVEL` and `SLIDER` widget writes to forward
+  decimal sensor values as JSON numbers.
+- Document decimal widget writes and BME690-to-widget runtime examples.
+
 ## 1.0.9
 
 - Added the MyDot Dev Studio Bridge with serial command execution, variables,
