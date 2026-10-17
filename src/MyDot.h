@@ -226,6 +226,10 @@ public:
   void begin();
   // Keeps Wi-Fi and MQTT connections alive; call continuously from loop().
   void run();
+  // Optional library diagnostics. Pass nullptr to silence them; application
+  // output and return values are unaffected. Defaults to Serial for sketches
+  // that already rely on the existing connection messages.
+  void setDiagnosticStream(Stream* stream);
   // Reboots the current board using its native reset API. Returns false only
   // when the selected Arduino core does not expose a safe reset primitive.
   bool reboot();
@@ -379,6 +383,7 @@ public:
   float getGasResistance();
 
 private:
+  Stream* _diagnosticStream = nullptr;
   // Debounce state for edge-triggered button click detection.
   unsigned long _lastPressTimeA = 0;
   unsigned long _lastPressTimeB = 0;

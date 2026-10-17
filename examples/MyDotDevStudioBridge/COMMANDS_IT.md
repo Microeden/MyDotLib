@@ -7,6 +7,9 @@ Il bridge legge una riga alla volta dalla `Serial` a **115200 baud**. Ogni
 comando deve terminare con un carattere newline. I comandi e i sottocomandi
 non distinguono maiuscole e minuscole; i valori testuali, come SSID Wi-Fi e
 token cloud, mantengono invece il loro contenuto originale.
+I dati ricevuti dal browser vengono elaborati in gruppi limitati (al massimo
+un comando completo per passaggio del loop), lasciando tempo al runtime e
+alla rete.
 
 Nel Serial Monitor selezionare **Newline** come terminazione di riga.
 
@@ -27,8 +30,10 @@ microSD. È una funzione del bridge aggiornato; con firmware precedenti resta
 disponibile il comando testuale `STOP`, ma non può anticipare un'operazione già
 in corso.
 
-All’avvio viene stampato `MyDot Dev Studio Bridge ready`. Viene inoltre
-indicato se la scheda microSD è stata inizializzata.
+Il Bridge non stampa messaggi diagnostici di avvio quando i log dettagliati
+sono disattivati. Inviare
+`STATUS` per verificare se la microSD è pronta e se il runtime salvato è in
+esecuzione.
 
 Per usare relay, NeoPixel e ventola alimentare la carrier tramite il jack DC
 esterno. La sola USB è sufficiente per la comunicazione seriale, ma può non
@@ -56,6 +61,7 @@ famiglia API, mentre `values` e `range` descrivono i valori ammessi.
 | `HELP` | Stampa l’elenco breve dei comandi. |
 | `CAPS` | Stampa capacità, argomenti, limiti e formato del file. |
 | `STATUS` | Mostra modello della scheda, collegamento/runtime, Wi‑Fi, My Microeden, capacità microSD e memoria heap ESP32 quando supportate. |
+| `LOGS ON|OFF|STATUS` | Attiva, disattiva o controlla i messaggi diagnostici spontanei del Bridge e della libreria MyDot. Dopo ogni avvio il valore predefinito è `OFF`. |
 | `ADD <runtime-command>` | Aggiunge un comando alla sequenza in memoria. |
 | `LIST` | Elenca la sequenza con indici a partire da zero. |
 | `CLEAR` | Conferma subito la cancellazione della sequenza in memoria, poi ferma l’esecuzione e porta relay, ventola e NeoPixel allo stato sicuro. Non cancella il file SD. |
@@ -65,6 +71,24 @@ famiglia API, mentre `values` e `range` descrivono i valori ammessi.
 | `STOP` | Ferma la sequenza, disattiva il watchdog runtime, spegne relay, ventola e NeoPixel e pulisce il display OLED. |
 | `REBOOT` | Arresta in sicurezza il runtime e riavvia la scheda MyDot usando il reset nativo del core Arduino selezionato. |
 | `EXEC <runtime-command>` | Esegue immediatamente un singolo comando. |
+
+Il Bridge è silenzioso per impostazione predefinita: non invia all'USB i
+messaggi di avvio, i log dei blocchi (`I2C DATA`, `VAR`, `OK WIDGET WRITE`),
+gli avvisi/errori del runtime né i messaggi Wi-Fi/MQTT della libreria MyDot.
+`LOGS ON` li attiva temporaneamente per il debug; `LOGS OFF` li disattiva e
+`LOGS STATUS` mostra l'impostazione corrente. L'impostazione non viene salvata
+in `/MyDot.run`. Restano sempre visibili le risposte ai comandi richiesti
+(inclusi `EXEC` e lo `STOP` di emergenza) e le istruzioni runtime esplicite
+`SERIAL <testo>`. Anche `STATUS` include `runtimeLogs=on|off`. Dopo una
+disconnessione si può interrogare `STATUS` oppure attivare i log prima di
+riprodurre il problema.
+Le descrizioni seguenti dell'output seriale ordinario dei comandi runtime si
+riferiscono a `EXEC` oppure alla sequenza residente con `LOGS ON`.
+
+Sulla Nano ESP32, il bridge limita l'attesa della trasmissione seriale USB:
+se il browser smette di leggere i log non dovrebbe bloccare indefinitamente
+il runtime residente. Questo non sostituisce il watchdog e non esclude blocchi
+dovuti ad altre operazioni.
 
 I comandi watchdog portabili sono disponibili come istruzioni runtime e anche
 tramite `EXEC`:
@@ -89,6 +113,18 @@ della scheda rilevato dal core Arduino), `wifi`,
 fisica della scheda (`cardSize()`); `sdTotalBytes` è la capacità utilizzabile
 del filesystem. Le dimensioni vengono restituite quando la scheda espone
 l’API corrispondente; altrimenti il valore è `unknown`.
+
+Su ESP32, `STATUS` mostra anche `resetReason`, `heapLargestBytes` e
+`heapMinimumBytes`. Dopo un riavvio non dovuto a spegnimento include
+`previousStage`, `previousIndex`, `previousHeapBytes`,
+`previousLargestBytes` e `previousMinimumBytes`, registrati senza scrivere
+sulla flash. Se interviene di nuovo il watchdog, questi campi indicano se il
+Bridge era nella rete, in una richiesta seriale (`serial-status`, `serial-caps`,
+`serial-exec`, `serial-other`) o in un comando del runtime; per quest'ultimo
+`LIST` permette di identificare `previousIndex`. Se diminuisce la memoria
+libera potrebbero esserci
+allocazioni trattenute; se diminuisce solo il blocco libero più grande mentre
+la memoria libera totale resta quasi stabile, potrebbe esserci frammentazione.
 
 Esempio:
 
@@ -167,6 +203,19 @@ GET KNOB_POSITION
 Il terzo comando calcola `298`, combinando i byte little-endian in un intero.
 Il risultato può essere usato da `IF_VAR`, da un comando di uscita o da un
 ulteriore `SET`.
+
+`BASE_CONVERT <valore> <baseDiPartenza> <baseDiArrivo> <variabile>` converte
+interi tra basi da 2 a 36. Il risultato è salvato come testo nella variabile
+indicata; sono accettati anche i prefissi `0b`, `0o` e `0x` per le basi 2, 8 e
+16. Per esempio:
+
+```text
+BASE_CONVERT FF 16 10 DECIMALE
+BASE_CONVERT $DECIMALE 10 2 BINARIO
+```
+
+Il primo comando salva `255` in `DECIMALE`; il secondo salva `11111111` in
+`BINARIO`. Il segno meno è supportato.
 
 `VARS` produce un output delimitato da `BEGIN_VARS` e `END_VARS`:
 
@@ -250,8 +299,17 @@ registro seguito da un byte di valore.
 Se viene indicato `prefix`, ogni byte ricevuto viene salvato in una variabile
 runtime chiamata `<prefix>0`, `<prefix>1` e così via. I blocchi successivi
 possono quindi usare il risultato, ad esempio `$WHO0`, nel display, nel cloud,
-in una condizione o in un log sulla SD. I byte vengono anche stampati in
-esadecimale con una riga `I2C DATA`.
+in una condizione o in un log sulla SD. Con i log dettagliati attivi (oppure
+con `EXEC`), i byte vengono anche stampati in esadecimale con una riga
+`I2C DATA`.
+
+Le operazioni I²C hanno un limite di tempo: sulla Nano ESP32 il bridge imposta
+un timeout di 50 ms per transazione e riprova fino a due volte una lettura
+incompleta. Se il dispositivo viene scollegato temporaneamente o mantiene il
+bus occupato, il bridge reinizializza `Wire`, segnala `WARN I2C`/`ERR I2C` e
+prosegue il runtime invece di terminare la sequenza salvata. Le variabili
+dell'ultima lettura completa restano disponibili, così un blocco successivo
+può decidere come gestire il campione mancante.
 
 Esempio:
 
@@ -512,12 +570,20 @@ accettato per compatibilità, ma il runtime del Bridge supporta `content`.
 `CLOUD SYNC` installa il callback di telemetria del bridge, che pubblica il
 nome del bridge e il numero corrente di comandi alla frequenza richiesta.
 
+Se MQTT è temporaneamente indisponibile, `CLOUD SEND` conserva in memoria i
+valori in attesa e il runtime salvato prosegue. Un invio successivo può
+pubblicarli dopo la riconnessione.
+
 ## Widget cloud
 
 ```text
 WIDGET READ <type> <key>
 WIDGET WRITE <type> <key> <value...>
 ```
+
+`WIDGET WRITE` pubblica subito il valore. Se MQTT è disconnesso, il valore
+rimane in attesa di un successivo `WIDGET WRITE` o `CLOUD SEND` e il runtime
+prosegue. Un eventuale `CLOUD SEND` dopo un invio riuscito è innocuo.
 
 | Tipo | Lettura | Scrittura |
 | --- | --- | --- |

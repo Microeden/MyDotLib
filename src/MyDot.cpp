@@ -57,8 +57,10 @@ void MyDot::mqttCallback(char* topic, byte* payload, unsigned int length) {
             ++device->_pendingCommandCount;
           }
           device->_pendingCommandQueue[slot] = command;
-          Serial.print("MyDot: Cloud command received: ");
-          Serial.println(command);
+          if (device->_diagnosticStream != nullptr) {
+            device->_diagnosticStream->print("MyDot: Cloud command received: ");
+            device->_diagnosticStream->println(command);
+          }
         }
         const char* val = kv.value().as<const char*>();
         if (val) {
@@ -163,6 +165,11 @@ MyDot::MyDot()
     _mqtt(_netClient) {
   // Only one MyDot object can receive PubSubClient callback messages.
   _instance = this;
+  _diagnosticStream = &Serial;
+}
+
+void MyDot::setDiagnosticStream(Stream* stream) {
+  _diagnosticStream = stream;
 }
 
 bool MyDot::rebootSupported() const {
@@ -217,10 +224,14 @@ void MyDot::serviceWatchdog() {
   if (!_watchdogEnabled || _watchdogTimeout == 0) return;
   if ((unsigned long)(millis() - _watchdogLastFeed) < _watchdogTimeout) return;
   _watchdogEnabled = false;
-  Serial.println("MyDot: watchdog timeout; rebooting.");
-  Serial.flush();
+  if (_diagnosticStream != nullptr) {
+    _diagnosticStream->println("MyDot: watchdog timeout; rebooting.");
+    _diagnosticStream->flush();
+  }
   delay(20);
-  if (!reboot()) Serial.println("MyDot: watchdog reboot is not available on this board.");
+  if (!reboot() && _diagnosticStream != nullptr) {
+    _diagnosticStream->println("MyDot: watchdog reboot is not available on this board.");
+  }
 }
 
 // --- Wi-Fi and cloud setup ---
@@ -231,7 +242,9 @@ void MyDot::beginWiFi(const char* ssid, const char* password) {
   (void)password;
   _wifiStarted = false;
   _timeConfigured = false;
-  Serial.println("MyDot: Wi-Fi is not available on this board.");
+  if (_diagnosticStream != nullptr) {
+    _diagnosticStream->println("MyDot: Wi-Fi is not available on this board.");
+  }
   return;
 #else
   // Save credentials for the automatic reconnect logic in run().
@@ -265,7 +278,9 @@ void MyDot::beginWiFi(const char* ssid, const char* password) {
     _timeConfigured = true;
 #endif
   } else {
-    Serial.println("MyDot: Wi-Fi connection started; run() will continue it asynchronously.");
+    if (_diagnosticStream != nullptr) {
+      _diagnosticStream->println("MyDot: Wi-Fi connection started; run() will continue it asynchronously.");
+    }
   }
 #endif
 }
@@ -275,7 +290,9 @@ void MyDot::beginCloud(const char* deviceId, const char* token) {
   (void)deviceId;
   (void)token;
   _cloudConfigured = false;
-  Serial.println("MyDot: My Microeden cloud is not available on this board.");
+  if (_diagnosticStream != nullptr) {
+    _diagnosticStream->println("MyDot: My Microeden cloud is not available on this board.");
+  }
   return;
 #else
   const String nextDeviceId = String(deviceId ? deviceId : "");
@@ -379,7 +396,9 @@ void MyDot::run() {
   if (WiFi.status() != WL_CONNECTED) {
     if (_mqtt.connected()) {
       _mqtt.disconnect();
-      Serial.println("MyDot: Wi-Fi lost; MQTT disconnected.");
+      if (_diagnosticStream != nullptr) {
+        _diagnosticStream->println("MyDot: Wi-Fi lost; MQTT disconnected.");
+      }
     }
 #if defined(ARDUINO_ARCH_ESP32)
     // Force NTP setup again after the station reconnects.  A new DHCP lease
@@ -394,7 +413,9 @@ void MyDot::run() {
         _wifiRestartPending = false;
         WiFi.begin(_ssid, _password);
         _lastWiFiAttempt = now;
-        Serial.println("MyDot: Wi-Fi reconnect attempt.");
+        if (_diagnosticStream != nullptr) {
+          _diagnosticStream->println("MyDot: Wi-Fi reconnect attempt.");
+        }
       }
     } else if (_lastWiFiAttempt == 0 || now - _lastWiFiAttempt >= 10000) {
       _lastWiFiAttempt = now;
@@ -404,7 +425,9 @@ void MyDot::run() {
       _wifiRestartAt = now;
 #else
       WiFi.begin(_ssid, _password);
-      Serial.println("MyDot: Wi-Fi reconnect attempt.");
+      if (_diagnosticStream != nullptr) {
+        _diagnosticStream->println("MyDot: Wi-Fi reconnect attempt.");
+      }
 #endif
     }
     return;
@@ -429,22 +452,34 @@ void MyDot::run() {
     if (_lastMqttAttempt == 0 || now - _lastMqttAttempt >= 5000) {
       _lastMqttAttempt = now;
       _mqtt.disconnect();
+#if defined(ARDUINO_ARCH_ESP32)
+      // PubSubClient's socket timeout does not bound the underlying TLS
+      // handshake. Limit that phase separately so a broker/network failure
+      // cannot monopolize the main loop until the task watchdog fires.
+      _netClient.setHandshakeTimeout(5);
+#endif
 
       if (_mqtt.connect(_clientId.c_str(), _deviceId.c_str(), _token.c_str())) {
         if (_mqtt.subscribe(_topicIn.c_str())) {
           _mqttFailureCount = 0;
-          Serial.println("MyDot: MQTT connected.");
+          if (_diagnosticStream != nullptr) {
+            _diagnosticStream->println("MyDot: MQTT connected.");
+          }
         } else {
-          Serial.println("MyDot: MQTT connected, but subscription failed.");
+          if (_diagnosticStream != nullptr) {
+            _diagnosticStream->println("MyDot: MQTT connected, but subscription failed.");
+          }
           _mqtt.disconnect();
         }
       } else {
         if (_mqttFailureCount < 255) {
           ++_mqttFailureCount;
         }
-        Serial.print("MyDot: MQTT reconnect failed (state ");
-        Serial.print(_mqtt.state());
-        Serial.println(").");
+        if (_diagnosticStream != nullptr) {
+          _diagnosticStream->print("MyDot: MQTT reconnect failed (state ");
+          _diagnosticStream->print(_mqtt.state());
+          _diagnosticStream->println(").");
+        }
 
         // If the station still reports WL_CONNECTED but the Internet path is
         // gone, retrying the same TCP stack forever is not enough.  After
@@ -458,7 +493,9 @@ void MyDot::run() {
           _wifiRestartAt = now;
 #else
           WiFi.begin(_ssid, _password);
-          Serial.println("MyDot: restarting Wi-Fi after repeated MQTT failures.");
+          if (_diagnosticStream != nullptr) {
+            _diagnosticStream->println("MyDot: restarting Wi-Fi after repeated MQTT failures.");
+          }
 #endif
           _lastWiFiAttempt = now;
         }
@@ -499,6 +536,10 @@ bool MyDot::sendCloud() {
 #if !MYDOT_HAS_CLOUD
   return false;
 #else
+  // A widget block may have published its value already. Treat an empty
+  // payload as complete instead of sending an empty JSON document when a
+  // following explicit CLOUD SEND instruction is executed.
+  if (_payloadDoc.size() == 0) return true;
   if (_mqtt.connected()) {
     // Serialize all values accumulated through writeKeyWord(). On success the
     // outgoing document is cleared so the next publication starts empty.
@@ -598,6 +639,13 @@ void MyDot::begin() {
   clearPixels();
 
   Wire.begin();
+#if defined(ARDUINO_ARCH_ESP32)
+  // A held SDA/SCL line must time out instead of blocking the application
+  // forever while an optional I2C peripheral is being probed or read.
+  Wire.setTimeOut(50);
+#elif defined(ARDUINO_ARCH_AVR)
+  Wire.setWireTimeout(50000UL, true);
+#endif
 
   // Probe the motor driver without making it a requirement for other features.
   validateAddress(FAN_ADDRESS);
@@ -832,10 +880,21 @@ void MyDot::updateSensorDisplay() {
 // --- BME690 sensor ---
 
 bool MyDot::readSensors() {
-  if (!bme.performReading()) {
-    return false;
+  // A disconnected BME690 or a bus that was held during a previous sample
+  // must not poison every later runtime iteration. The ESP32 Wire timeout
+  // makes the failed transaction finite; restarting Wire gives the next
+  // attempt a clean peripheral state.
+  for (uint8_t attempt = 0; attempt < 2; ++attempt) {
+    if (bme.performReading()) {
+      return true;
+    }
+#if defined(ARDUINO_ARCH_ESP32)
+    Wire.end();
+    Wire.begin();
+    Wire.setTimeOut(50);
+#endif
   }
-  return true;
+  return false;
 }
 
 float MyDot::getTemperature() {

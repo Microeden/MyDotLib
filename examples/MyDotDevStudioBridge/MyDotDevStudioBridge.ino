@@ -19,6 +19,7 @@
  *   STOP                         Stop execution and switch outputs off
  *   EXEC <runtime command>       Execute one command immediately
  *   STATUS                       Report connections, resources, sequence, and runtime status
+ *   LOGS ON|OFF|STATUS           Enable/disable verbose resident-runtime logs
  *
  * If /MyDot.run is present on the microSD at boot, it is verified,
  * loaded and started automatically so the saved project resumes after a
@@ -96,9 +97,18 @@
 
 #include <MyDot.h>
 #include <Wire.h>
+#include <ctype.h>
 #include <math.h>
 #include "microeden_secrets.h"
 #include "runtime_integer_expression.h"
+
+#if defined(ARDUINO_ARCH_ESP32)
+#include <esp_attr.h>
+#include <esp_heap_caps.h>
+#include <esp_idf_version.h>
+#include <esp_task_wdt.h>
+#include <soc/soc_caps.h>
+#endif
 
 #if !defined(ARDUINO_ARCH_ESP32)
 // The portable Arduino SD library is a thin wrapper around SdFat.  Its
@@ -107,10 +117,54 @@
 #include <utility/SdFat.h>
 #endif
 
+// Keep unsolicited Bridge output off the USB port until the user requests
+// verbose diagnostics. Protocol replies and explicit SERIAL instructions are
+// enabled only for their duration. A slow browser must not dictate the cloud
+// loop rate.
+Stream& bridgePhysicalSerial() { return Serial; }
+void beginBridgePhysicalSerial(unsigned long baud) { Serial.begin(baud); }
+void limitBridgeUsbWriteWait() {
+#if defined(ARDUINO_NANO_ESP32) && defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
+  // Keep this above zero: some ESP32 USB CDC core versions mishandle a zero
+  // TX timeout. A stalled web reader should lose logs, not stop the runtime.
+  Serial.setTxTimeoutMs(10);
+#endif
+}
+
+class BridgeSerialOutput : public Stream {
+ public:
+  void begin(unsigned long baud) { beginBridgePhysicalSerial(baud); }
+  int available() override { return bridgePhysicalSerial().available(); }
+  int read() override { return bridgePhysicalSerial().read(); }
+  int peek() override { return bridgePhysicalSerial().peek(); }
+  void flush() override {
+    if (outputEnabled) bridgePhysicalSerial().flush();
+  }
+
+  size_t write(uint8_t value) override { return write(&value, 1); }
+  size_t write(const uint8_t* data, size_t size) override {
+    return outputEnabled ? bridgePhysicalSerial().write(data, size) : size;
+  }
+  using Print::write;
+
+  void setOutputEnabled(bool enabled) { outputEnabled = enabled; }
+  bool isOutputEnabled() const { return outputEnabled; }
+
+ private:
+  bool outputEnabled = false;
+};
+
+BridgeSerialOutput bridgeSerial;
+#undef Serial
+#define Serial bridgeSerial
+
 const char* RUNTIME_FILE = "/MyDot.run";
 const uint16_t MAX_COMMAND_LENGTH = 96;
 const uint16_t MAX_RUNTIME_BYTES = 4096;
 const uint16_t MAX_SERIAL_LINE_LENGTH = 192;
+// A browser can queue commands faster than they can be executed. Bound USB
+// receive work so the network and resident runtime still get CPU time.
+const uint8_t MAX_SERIAL_BYTES_PER_PASS = 96;
 // Byte di controllo fuori banda. Il Dev Studio lo invia senza attendere la
 // coda delle richieste normali, così STOP può essere rilevato anche mentre
 // una lettura/scrittura della microSD è ancora in corso.
@@ -125,6 +179,9 @@ const uint8_t MAX_VARIABLE_NAME_LENGTH = 16;
 const uint8_t MAX_VARIABLE_VALUE_LENGTH = 64;
 const uint8_t MAX_I2C_TRANSFER_BYTES = 32;
 const uint32_t DEFAULT_I2C_FREQUENCY = 100000UL;
+const uint16_t I2C_TRANSACTION_TIMEOUT_MS = 50;
+const uint8_t I2C_READ_RETRIES = 2;
+const uint32_t BRIDGE_TASK_WATCHDOG_TIMEOUT_MS = 15000UL;
 const uint32_t FILE_FORMAT_VERSION = 1;
 
 // This key identifies this bridge firmware. Change it for a product-specific
@@ -143,6 +200,7 @@ bool sdReady = false;
 bool i2cReady = false;
 uint32_t i2cFrequency = DEFAULT_I2C_FREQUENCY;
 bool runtimeRunning = false;
+bool runtimeLogsEnabled = false;
 uint16_t runtimeIndex = 0;
 unsigned long runtimeWaitUntil = 0;
 struct RuntimeLoopFrame {
@@ -179,18 +237,150 @@ String runtimeCloudExpectedCommand;
 // un click breve poteva cadere tra due chiamate a serviceRuntime().
 bool runtimeButtonAClickPending = false;
 bool runtimeButtonBClickPending = false;
-String serialLine;
+char serialLine[MAX_SERIAL_LINE_LENGTH + 1] = {};
+uint16_t serialLineLength = 0;
 bool serialLineOverflow = false;
 bool emergencyStopRequested = false;
 bool rebootRequested = false;
+bool rebootRequestedFromSerial = false;
+bool runtimeTransientFailure = false;
 char decryptedScript[MAX_RUNTIME_BYTES + 1];
 
+#if defined(ARDUINO_ARCH_ESP32)
+bool bridgeTaskWatchdogReady = false;
+const uint32_t BRIDGE_TRACE_MAGIC = 0x4D445442UL;
+enum BridgeStage : uint8_t {
+  BRIDGE_STAGE_SETUP = 1,
+  BRIDGE_STAGE_SERIAL,
+  BRIDGE_STAGE_BUTTONS,
+  BRIDGE_STAGE_NETWORK,
+  BRIDGE_STAGE_RUNTIME,
+  BRIDGE_STAGE_COMMAND,
+  BRIDGE_STAGE_REBOOT,
+  BRIDGE_STAGE_IDLE,
+  BRIDGE_STAGE_SERIAL_STATUS,
+  BRIDGE_STAGE_SERIAL_CAPS,
+  BRIDGE_STAGE_SERIAL_EXEC,
+  BRIDGE_STAGE_SERIAL_OTHER
+};
+struct BridgeTrace {
+  uint32_t magic;
+  uint32_t magicInverse;
+  uint32_t freeHeap;
+  uint32_t largestBlock;
+  uint32_t minimumFreeHeap;
+  uint16_t commandIndex;
+  uint8_t stage;
+};
+// RTC memory survives the watchdog's warm reboot without a flash write on
+// every instruction. Keep only fixed-size diagnostics, never credentials.
+#if SOC_RTC_FAST_MEM_SUPPORTED || SOC_RTC_SLOW_MEM_SUPPORTED
+RTC_NOINIT_ATTR BridgeTrace rtcBridgeTrace;
+#else
+BridgeTrace rtcBridgeTrace;
+#endif
+BridgeTrace previousBridgeTrace = {};
+bool previousBridgeTraceValid = false;
+esp_reset_reason_t bridgeResetReason = ESP_RST_UNKNOWN;
+#endif
+
 const char* currentBoardName();
+
+void markBridgeStage(uint8_t stage, uint16_t commandIndex = 0) {
+#if defined(ARDUINO_ARCH_ESP32)
+  rtcBridgeTrace.commandIndex = commandIndex;
+  rtcBridgeTrace.stage = stage;
+#else
+  (void)stage;
+  (void)commandIndex;
+#endif
+}
+
+#if defined(ARDUINO_ARCH_ESP32)
+const char* bridgeStageName(uint8_t stage) {
+  switch (stage) {
+    case BRIDGE_STAGE_SETUP: return "setup";
+    case BRIDGE_STAGE_SERIAL: return "serial";
+    case BRIDGE_STAGE_BUTTONS: return "buttons";
+    case BRIDGE_STAGE_NETWORK: return "network";
+    case BRIDGE_STAGE_RUNTIME: return "runtime";
+    case BRIDGE_STAGE_COMMAND: return "command";
+    case BRIDGE_STAGE_REBOOT: return "reboot";
+    case BRIDGE_STAGE_IDLE: return "idle";
+    case BRIDGE_STAGE_SERIAL_STATUS: return "serial-status";
+    case BRIDGE_STAGE_SERIAL_CAPS: return "serial-caps";
+    case BRIDGE_STAGE_SERIAL_EXEC: return "serial-exec";
+    case BRIDGE_STAGE_SERIAL_OTHER: return "serial-other";
+    default: return "unknown";
+  }
+}
+
+void beginBridgeTrace() {
+  bridgeResetReason = esp_reset_reason();
+  previousBridgeTraceValid = bridgeResetReason != ESP_RST_POWERON &&
+                             rtcBridgeTrace.magic == BRIDGE_TRACE_MAGIC &&
+                             rtcBridgeTrace.magicInverse == ~BRIDGE_TRACE_MAGIC;
+  if (previousBridgeTraceValid) previousBridgeTrace = rtcBridgeTrace;
+  rtcBridgeTrace.magic = BRIDGE_TRACE_MAGIC;
+  rtcBridgeTrace.magicInverse = ~BRIDGE_TRACE_MAGIC;
+  rtcBridgeTrace.freeHeap = 0;
+  rtcBridgeTrace.largestBlock = 0;
+  rtcBridgeTrace.minimumFreeHeap = 0;
+  markBridgeStage(BRIDGE_STAGE_SETUP);
+}
+
+void sampleBridgeMemory() {
+  rtcBridgeTrace.freeHeap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  rtcBridgeTrace.largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  rtcBridgeTrace.minimumFreeHeap = esp_get_minimum_free_heap_size();
+}
+#endif
+
+// The cooperative MyDot watchdog is useful while the main loop is healthy,
+// but it cannot run if a core API blocks inside a driver call. The ESP32 task
+// watchdog is the final recovery path for that case: after a reboot, setup()
+// automatically loads /MyDot.run again.
+void beginBridgeTaskWatchdog() {
+#if defined(ARDUINO_ARCH_ESP32)
+  esp_err_t status = ESP_OK;
+#if ESP_IDF_VERSION_MAJOR >= 5
+  esp_task_wdt_config_t config = {};
+  config.timeout_ms = BRIDGE_TASK_WATCHDOG_TIMEOUT_MS;
+  config.idle_core_mask = 0;
+  config.trigger_panic = true;
+  status = esp_task_wdt_init(&config);
+  if (status == ESP_ERR_INVALID_STATE) {
+    // The ESP32 core may have initialized the watchdog before setup().
+    status = esp_task_wdt_reconfigure(&config);
+  }
+#else
+  status = esp_task_wdt_init(BRIDGE_TASK_WATCHDOG_TIMEOUT_MS / 1000UL, true);
+  if (status == ESP_ERR_INVALID_STATE) status = ESP_OK;
+#endif
+  if (status == ESP_OK && esp_task_wdt_status(nullptr) != ESP_OK) {
+    status = esp_task_wdt_add(nullptr);
+  }
+  bridgeTaskWatchdogReady = status == ESP_OK;
+  if (!bridgeTaskWatchdogReady) {
+    Serial.print(F("WARN bridge watchdog unavailable code="));
+    Serial.println((int)status);
+  }
+#endif
+}
+
+void feedBridgeTaskWatchdog() {
+#if defined(ARDUINO_ARCH_ESP32)
+  if (bridgeTaskWatchdogReady) {
+    esp_task_wdt_reset();
+  }
+#endif
+}
 
 void publishBridgeCloudSync() {
   dot.writeKeyWord("bridge", "MyDotDevStudioBridge");
   dot.writeKeyWord("runtimeCommands", (int)runtimeCommandCount);
-  dot.sendCloud();
+  const bool sent = dot.sendCloud();
+  Serial.println(sent ? F("OK CLOUD SYNC SEND") : F("WARN CLOUD SYNC SEND unavailable"));
 }
 
 struct RuntimeFileHeader {
@@ -301,9 +491,19 @@ String runtimeCommandAt(uint16_t target) {
   uint16_t start = 0;
   for (uint16_t index = 0; index <= runtimeScriptLength; ++index) {
     if (index < runtimeScriptLength && decryptedScript[index] != '\n') continue;
-    String line = runtimeScriptLine(start, index);
-    if (line.length() > 0) {
-      if (current == target) return line;
+    // The continuous runtime used to allocate a String for every preceding
+    // line on every instruction. Only allocate for the requested command;
+    // otherwise a looping script creates thousands of needless heap churns.
+    bool hasContent = false;
+    for (uint16_t character = start; character < index; ++character) {
+      const char value = decryptedScript[character];
+      if (value != ' ' && value != '\t' && value != '\r') {
+        hasContent = true;
+        break;
+      }
+    }
+    if (hasContent) {
+      if (current == target) return runtimeScriptLine(start, index);
       ++current;
     }
     start = index + 1;
@@ -341,7 +541,7 @@ uint32_t scriptCrc() {
 
 void printHelp() {
   Serial.println(F("MyDot Dev Studio Bridge protocol:"));
-  Serial.println(F("  HELP | CAPS | STATUS"));
+  Serial.println(F("  HELP | CAPS | STATUS | LOGS ON|OFF|STATUS"));
   Serial.println(F("  ADD <runtime command>"));
   Serial.println(F("  LIST | CLEAR | SAVE | LOAD | RUN | STOP"));
   Serial.println(F("  REBOOT"));
@@ -364,6 +564,7 @@ void printHelp() {
   Serial.println(F("  BUTTON ... (A/B PRESSED/CLICKED or READ A/B ...) | COLOR ... | WIDGET ..."));
   Serial.println(F("  DIGITAL_READ/WRITE | ANALOG_READ/WRITE"));
   Serial.println(F("  SET <name> <value> | GET <name> | VARS | UNSET <name> | CLEAR_VARS"));
+  Serial.println(F("  BASE_CONVERT <value> <fromBase> <toBase> <variable> (bases 2..36)"));
   Serial.println(F("  IF_VAR <name> <op> <value> GOTO <label>"));
   Serial.println(F("  LABEL <name> | GOTO <name> | IF_BUTTON A|B PRESSED|CLICKED GOTO <name>"));
   Serial.println(F("  WAIT_BUTTON A|B PRESSED|CLICKED [timeoutMs] [GOTO label]"));
@@ -393,7 +594,7 @@ void printCapabilities() {
   Serial.println(dot.rebootSupported() ? F("cooperative") : F("unavailable"));
   Serial.print(F("CAPS PINS "));
   Serial.println(F(MYDOT_PIN_MAP_NAME));
-  Serial.println(F("CAPS TOPLEVEL HELP CAPS STATUS ADD LIST CLEAR SAVE LOAD RUN STOP REBOOT EXEC"));
+  Serial.println(F("CAPS TOPLEVEL HELP CAPS STATUS LOGS ADD LIST CLEAR SAVE LOAD RUN STOP REBOOT EXEC"));
   Serial.print(F("CAPS RUNTIME DELAY RELAY BRIGHTNESS PIXELS PIXEL PIXELS_SHOW PIXELS_RANDOM CLEAR_PIXELS FAN DISPLAY SENSORS SENSOR_READ SENSORS_LOG I2C SERIAL"));
 #if MYDOT_HAS_WIFI
   Serial.print(F(" WIFI TIME"));
@@ -404,7 +605,7 @@ void printCapabilities() {
 #if MYDOT_HAS_SD_CAPACITY
   Serial.print(F(" SD"));
 #endif
-  Serial.println(F(" BUTTON COLOR WIDGET DIGITAL_READ DIGITAL_WRITE ANALOG_READ ANALOG_WRITE SET GET VARS UNSET CLEAR_VARS IF_VAR LABEL GOTO IF_BUTTON WAIT_BUTTON REPEAT ENDREPEAT BREAK CONTINUE WATCHDOG REBOOT NOOP"));
+  Serial.println(F(" BUTTON COLOR WIDGET DIGITAL_READ DIGITAL_WRITE ANALOG_READ ANALOG_WRITE SET BASE_CONVERT GET VARS UNSET CLEAR_VARS IF_VAR LABEL GOTO IF_BUTTON WAIT_BUTTON REPEAT ENDREPEAT BREAK CONTINUE WATCHDOG REBOOT NOOP"));
   // Non esiste più un tetto fisso al numero di righe: il limite effettivo è
   // la dimensione del payload e la lunghezza massima della singola riga.
   Serial.println(F("CAPS LIMITS commandLength=96 scriptBytes=4096"));
@@ -413,6 +614,7 @@ void printCapabilities() {
   Serial.println(F("CAPS COMMAND HELP args=none type=action"));
   Serial.println(F("CAPS COMMAND CAPS args=none type=metadata"));
   Serial.println(F("CAPS COMMAND STATUS args=none type=status"));
+  Serial.println(F("CAPS COMMAND LOGS args=state type=enum values=ON|OFF|STATUS default=OFF"));
   Serial.println(F("CAPS COMMAND ADD args=command type=runtime"));
   Serial.println(F("CAPS COMMAND LIST args=none type=action"));
   Serial.println(F("CAPS COMMAND CLEAR args=none type=action"));
@@ -434,6 +636,7 @@ void printCapabilities() {
   Serial.println(F("CAPS COMMAND NOOP args=none type=action"));
   Serial.println(F("CAPS COMMAND DELAY args=milliseconds type=uint range=0..300000"));
   Serial.println(F("CAPS COMMAND SET args=name,value type=variable"));
+  Serial.println(F("CAPS COMMAND BASE_CONVERT args=value,fromBase,toBase,variable type=variable result=variable"));
   Serial.println(F("CAPS COMMAND GET args=name type=variable"));
   Serial.println(F("CAPS COMMAND VARS args=none type=variable"));
   Serial.println(F("CAPS COMMAND UNSET args=name type=variable"));
@@ -641,6 +844,9 @@ void clearRuntimeVariables() {
 
 String expandRuntimeVariables(const String& input) {
   String output;
+  // Most commands contain no variables; reserve once instead of growing the
+  // heap allocation for every character as this runs on each loop iteration.
+  if (!output.reserve(input.length())) return String();
   for (size_t index = 0; index < input.length();) {
     if (input[index] != '$') {
       output += input[index++];
@@ -936,7 +1142,10 @@ bool pollEmergencyStop() {
   }
   if (!emergencyStopRequested) return false;
   emergencyStopRequested = false;
+  const bool previousOutput = bridgeSerial.isOutputEnabled();
+  bridgeSerial.setOutputEnabled(true);  // ETX is an explicit control request.
   stopRuntime();
+  bridgeSerial.setOutputEnabled(previousOutput);
   return true;
 }
 
@@ -979,14 +1188,19 @@ void requestDeviceReboot() {
 void serviceDeviceReboot() {
   if (!rebootRequested) return;
   rebootRequested = false;
+  const bool previousOutput = bridgeSerial.isOutputEnabled();
+  if (rebootRequestedFromSerial) bridgeSerial.setOutputEnabled(true);
+  rebootRequestedFromSerial = false;
   if (!dot.rebootSupported()) {
     Serial.println(F("ERR REBOOT unsupported-on-board"));
+    bridgeSerial.setOutputEnabled(previousOutput);
     return;
   }
   Serial.println(F("OK REBOOT"));
   Serial.flush();
   delay(50);
   dot.reboot();
+  bridgeSerial.setOutputEnabled(previousOutput);
 }
 
 bool parseButtonCondition(String& text, uint8_t& button, bool& click) {
@@ -1647,6 +1861,7 @@ bool executeCloudCommand(String rest, bool allowDelay) {
     }
     bool success = dot.sendCloud();
     Serial.println(success ? F("OK CLOUD SEND") : F("ERR CLOUD SEND"));
+    if (!success) runtimeTransientFailure = true;
     return success;
   }
   if (operation == "STATUS") {
@@ -1977,7 +2192,12 @@ bool executeWidgetCommand(String rest) {
     return false;
   }
 
+  // A visual "send to My Microeden" block must publish its value, not only
+  // add it to the local JSON buffer. A failed publish leaves the payload in
+  // MyDot for the next write or CLOUD SEND after MQTT reconnects.
+  const bool published = dot.sendCloud();
   Serial.println(F("OK WIDGET WRITE"));
+  if (!published) Serial.println(F("WARN CLOUD SEND deferred"));
   return true;
 }
 
@@ -2053,52 +2273,109 @@ bool ensureI2cBus() {
   if (!i2cReady) {
     Wire.begin();
     Wire.setClock(i2cFrequency);
+#if defined(ARDUINO_ARCH_ESP32)
+    // Prevent a missing device or a held SDA/SCL line from blocking the
+    // runtime forever. Arduino-ESP32 exposes this timeout on TwoWire.
+    Wire.setTimeOut(I2C_TRANSACTION_TIMEOUT_MS);
+#elif defined(ARDUINO_ARCH_AVR)
+    // Keep this bridge portable to AVR cores that expose the Wire timeout API.
+    Wire.setWireTimeout((uint32_t)I2C_TRANSACTION_TIMEOUT_MS * 1000UL, true);
+#endif
     i2cReady = true;
   }
   return true;
 }
 
-bool readI2cBytes(uint8_t address, uint8_t length, const String& variablePrefix) {
+void recoverI2cBus() {
+#if defined(ARDUINO_ARCH_ESP32)
+  // The ESP32 Wire implementation can be restarted after a timed-out
+  // transaction. This releases the peripheral lock before the next retry.
+  Wire.end();
+#endif
+  i2cReady = false;
+  ensureI2cBus();
+}
+
+bool readI2cBytes(uint8_t address, uint8_t length, const String& variablePrefix,
+                  const uint8_t* writeBytes, uint8_t writeLength) {
   if (!ensureI2cBus()) {
     Serial.println(F("ERR I2C unavailable"));
     return false;
   }
 
-  uint8_t requested = Wire.requestFrom(address, length, (uint8_t)true);
-  (void)requested;
-  uint8_t received = 0;
-  Serial.print(F("I2C DATA "));
-  printI2cAddress(address);
-  while (Wire.available() && received < length) {
-    uint8_t value = (uint8_t)Wire.read();
-    if (received > 0) Serial.print(' ');
-    printI2cByte(value);
-    if (variablePrefix.length() > 0) {
-      String variableName = variablePrefix + String(received);
-      if (!setRuntimeVariable(variableName, String(value))) {
-        Serial.println();
-        Serial.println(F("ERR I2C invalid-variable-prefix"));
-        return false;
+  for (uint8_t attempt = 0; attempt <= I2C_READ_RETRIES; ++attempt) {
+    if (writeLength > 0) {
+      // Repeat the register/command write on every attempt. Retrying only
+      // requestFrom() would read from the wrong position on many sensors.
+      Wire.beginTransmission(address);
+      for (uint8_t index = 0; index < writeLength; ++index) {
+        Wire.write(writeBytes[index]);
+      }
+      uint8_t status = Wire.endTransmission(false);
+      if (status != 0) {
+        Serial.print(F("WARN I2C write-status attempt="));
+        Serial.print(attempt + 1);
+        Serial.print(F(" status="));
+        Serial.println(status);
+        recoverI2cBus();
+        continue;
       }
     }
-    ++received;
-  }
-  Serial.println();
-  if (received != length) {
-    Serial.print(F("ERR I2C short-read expected="));
+    uint8_t requested = Wire.requestFrom(address, length, (uint8_t)true);
+    (void)requested;
+    uint8_t received = 0;
+    uint8_t values[MAX_I2C_TRANSFER_BYTES];
+    while (Wire.available() && received < length) {
+      values[received++] = (uint8_t)Wire.read();
+    }
+
+    if (received == length) {
+      Serial.print(F("I2C DATA "));
+      printI2cAddress(address);
+      Serial.print(' ');
+      for (uint8_t index = 0; index < length; ++index) {
+        if (index > 0) Serial.print(' ');
+        printI2cByte(values[index]);
+        if (variablePrefix.length() > 0) {
+          String variableName = variablePrefix + String(index);
+          if (!setRuntimeVariable(variableName, String(values[index]))) {
+            Serial.println();
+            Serial.println(F("ERR I2C invalid-variable-prefix"));
+            return false;
+          }
+        }
+      }
+      Serial.println();
+      Serial.print(F("OK I2C READ length="));
+      Serial.println(received);
+      return true;
+    }
+
+    Serial.print(F("WARN I2C short-read attempt="));
+    Serial.print(attempt + 1);
+    Serial.print(F(" expected="));
     Serial.print(length);
     Serial.print(F(" received="));
     Serial.println(received);
-    return false;
+    recoverI2cBus();
   }
-  Serial.print(F("OK I2C READ length="));
-  Serial.println(received);
-  return true;
+
+  Serial.println(F("ERR I2C read-failed; runtime will continue"));
+  runtimeTransientFailure = true;
+  return false;
+}
+
+bool readI2cBytes(uint8_t address, uint8_t length, const String& variablePrefix) {
+  return readI2cBytes(address, length, variablePrefix, nullptr, 0);
 }
 
 bool performI2cTransfer(uint8_t address, const uint8_t* writeBytes,
                         uint8_t writeLength, uint8_t readLength,
                         const String& variablePrefix) {
+  if (readLength > 0) {
+    return readI2cBytes(address, readLength, variablePrefix,
+                        writeBytes, writeLength);
+  }
   if (!ensureI2cBus()) {
     Serial.println(F("ERR I2C unavailable"));
     return false;
@@ -2109,19 +2386,20 @@ bool performI2cTransfer(uint8_t address, const uint8_t* writeBytes,
     for (uint8_t index = 0; index < writeLength; ++index) {
       Wire.write(writeBytes[index]);
     }
-    uint8_t status = Wire.endTransmission(readLength > 0 ? false : true);
+    uint8_t status = Wire.endTransmission(true);
     if (status != 0) {
       Serial.print(F("ERR I2C write-status="));
       Serial.println(status);
+      // A failed write can leave the peripheral state machine out of sync;
+      // restart the bus before the next runtime instruction.
+      recoverI2cBus();
+      runtimeTransientFailure = true;
       return false;
     }
   }
 
-  if (readLength == 0) {
-    Serial.println(F("OK I2C WRITE"));
-    return true;
-  }
-  return readI2cBytes(address, readLength, variablePrefix);
+  Serial.println(F("OK I2C WRITE"));
+  return true;
 }
 
 bool executeI2cCommand(String rest) {
@@ -2137,9 +2415,13 @@ bool executeI2cCommand(String rest) {
       }
       i2cFrequency = (uint32_t)frequency;
     }
-    Wire.begin();
-    Wire.setClock(i2cFrequency);
-    i2cReady = true;
+    // Recreate the peripheral with the newly selected clock. On ESP32 the
+    // explicit end also releases a peripheral left in an error state.
+#if defined(ARDUINO_ARCH_ESP32)
+    Wire.end();
+#endif
+    i2cReady = false;
+    ensureI2cBus();
     Serial.print(F("OK I2C BEGIN frequency="));
     Serial.println(i2cFrequency);
     return true;
@@ -2286,6 +2568,75 @@ bool executeI2cCommand(String rest) {
   return false;
 }
 
+bool parseNumericBase(String token, uint8_t& base) {
+  token.trim();
+  token.toUpperCase();
+  if (token == "BIN" || token == "BINARY") base = 2;
+  else if (token == "OCT" || token == "OCTAL") base = 8;
+  else if (token == "DEC" || token == "DECIMAL") base = 10;
+  else if (token == "HEX" || token == "HEXADECIMAL") base = 16;
+  else {
+    char* end = nullptr;
+    long parsed = strtol(token.c_str(), &end, 10);
+    if (token.length() == 0 || end == token.c_str() || *end != '\0' || parsed < 2 || parsed > 36) return false;
+    base = (uint8_t)parsed;
+  }
+  return true;
+}
+
+bool parseBaseInteger(const String& input, uint8_t base, uint64_t& magnitude, bool& negative) {
+  String text = input;
+  text.trim();
+  text.toUpperCase();
+  if (text.length() == 0) return false;
+
+  size_t position = 0;
+  negative = false;
+  if (text[position] == '+' || text[position] == '-') {
+    negative = text[position] == '-';
+    ++position;
+  }
+  if (position >= text.length()) return false;
+
+  const String digits = text.substring(position);
+  if ((base == 2 && digits.startsWith("0B")) ||
+      (base == 8 && digits.startsWith("0O")) ||
+      (base == 16 && digits.startsWith("0X"))) {
+    position += 2;
+  }
+  if (position >= text.length()) return false;
+
+  magnitude = 0;
+  const uint64_t maximum = (uint64_t)-1;
+  for (; position < text.length(); ++position) {
+    const char character = text[position];
+    uint8_t digit = 0;
+    if (character >= '0' && character <= '9') digit = (uint8_t)(character - '0');
+    else if (character >= 'A' && character <= 'Z') digit = (uint8_t)(character - 'A' + 10);
+    else return false;
+    if (digit >= base || magnitude > (maximum - digit) / base) return false;
+    magnitude = magnitude * base + digit;
+  }
+  if (negative && magnitude > (1ULL << 63)) return false;
+  if (magnitude == 0) negative = false;
+  return true;
+}
+
+String formatBaseInteger(uint64_t magnitude, uint8_t base, bool negative) {
+  const char alphabet[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  char digits[66];
+  size_t cursor = sizeof(digits) - 1;
+  digits[cursor] = '\0';
+  do {
+    digits[--cursor] = alphabet[magnitude % base];
+    magnitude /= base;
+  } while (magnitude > 0);
+  String result;
+  if (negative) result += '-';
+  result += &digits[cursor];
+  return result;
+}
+
 bool executeRuntimeCommand(String command, bool allowDelay) {
   command.trim();
   if (command.length() == 0 || command.startsWith("#")) {
@@ -2370,6 +2721,32 @@ bool executeRuntimeCommand(String command, bool allowDelay) {
     }
     if (!setRuntimeVariable(name, value)) {
       Serial.println(F("ERR RUNTIME SET expected-name-and-value"));
+      return false;
+    }
+    return true;
+  }
+
+  if (operation == "BASE_CONVERT") {
+    String input = takeToken(rest);
+    String fromToken = takeToken(rest);
+    String toToken = takeToken(rest);
+    String outputVariable = takeToken(rest);
+    uint8_t fromBase = 0;
+    uint8_t toBase = 0;
+    uint64_t magnitude = 0;
+    bool negative = false;
+    if (input.length() == 0 || fromToken.length() == 0 || toToken.length() == 0 ||
+        outputVariable.length() == 0 || rest.length() > 0 ||
+        !parseNumericBase(fromToken, fromBase) || !parseNumericBase(toToken, toBase)) {
+      Serial.println(F("ERR RUNTIME BASE_CONVERT expected-value-bases-variable"));
+      return false;
+    }
+    if (!parseBaseInteger(input, fromBase, magnitude, negative)) {
+      Serial.println(F("ERR RUNTIME BASE_CONVERT invalid-integer"));
+      return false;
+    }
+    if (!setRuntimeVariable(outputVariable, formatBaseInteger(magnitude, toBase, negative))) {
+      Serial.println(F("ERR RUNTIME BASE_CONVERT invalid-variable"));
       return false;
     }
     return true;
@@ -2862,6 +3239,7 @@ bool executeRuntimeCommand(String command, bool allowDelay) {
     }
     if (!dot.readSensors()) {
       Serial.println(F("ERR RUNTIME SENSORS unavailable"));
+      runtimeTransientFailure = true;
       return false;
     }
     Serial.print(F("SENSOR temperature="));
@@ -2885,6 +3263,7 @@ bool executeRuntimeCommand(String command, bool allowDelay) {
     }
     if (!dot.readSensors()) {
       Serial.println(F("ERR RUNTIME SENSOR_READ unavailable"));
+      runtimeTransientFailure = true;
       return false;
     }
 
@@ -2924,6 +3303,7 @@ bool executeRuntimeCommand(String command, bool allowDelay) {
     }
     if (!dot.readSensors()) {
       Serial.println(F("ERR RUNTIME SENSORS_LOG unavailable"));
+      runtimeTransientFailure = true;
       return false;
     }
 
@@ -3140,6 +3520,15 @@ bool executeRuntimeCommand(String command, bool allowDelay) {
   return false;
 }
 
+bool isExplicitSerialCommand(const String& command) {
+  static const char name[] = "SERIAL";
+  if (command.length() < 6) return false;
+  for (uint8_t index = 0; index < 6; ++index) {
+    if (toupper((unsigned char)command[index]) != name[index]) return false;
+  }
+  return command.length() == 6 || command[6] == ' ' || command[6] == '\t';
+}
+
 void serviceRuntime() {
   // Anche il ciclo runtime deve lasciare immediatamente la precedenza al
   // canale di controllo USB.
@@ -3205,11 +3594,29 @@ void serviceRuntime() {
 
   String command = runtimeCommandAt(runtimeIndex);
   ++runtimeIndex;
-  if (!executeRuntimeCommand(command, true)) {
+  runtimeTransientFailure = false;
+#if defined(ARDUINO_ARCH_ESP32)
+  markBridgeStage(BRIDGE_STAGE_COMMAND, runtimeIndex - 1);
+#endif
+  const bool previousOutput = bridgeSerial.isOutputEnabled();
+  bridgeSerial.setOutputEnabled(runtimeLogsEnabled || isExplicitSerialCommand(command));
+  const bool commandSucceeded = executeRuntimeCommand(command, true);
+  bridgeSerial.setOutputEnabled(previousOutput);
+  if (!commandSucceeded) {
+    if (runtimeTransientFailure) {
+      // Sensor, I2C and MQTT outages can clear without changing the saved
+      // program. Let the rest of the loop run so reconnection and Serial
+      // remain responsive; sendCloud() keeps unsent telemetry buffered.
+      runtimeWaitUntil = millis() + 250;
+      Serial.println(F("WARN RUN temporary I/O failure; continuing"));
+      return;
+    }
     runtimeRunning = false;
     resetRuntimeControlState();
     stopRuntimeOutputs();
     Serial.println(F("ERR RUN stopped"));
+    Serial.print(F("INFO RUN stopped-index="));
+    Serial.println(runtimeIndex - 1);
   }
 }
 
@@ -3514,6 +3921,8 @@ void printStatus() {
   }
   Serial.print(F(" variables="));
   Serial.print(variableCount);
+  Serial.print(F(" runtimeLogs="));
+  Serial.print(runtimeLogsEnabled ? F("on") : F("off"));
   Serial.print(F(" running="));
   Serial.print(runtimeRunning ? F("true") : F("false"));
   Serial.print(F(" waitingButton="));
@@ -3601,6 +4010,26 @@ void printStatus() {
   } else {
     Serial.print(F(" ramFreeBytes=unknown ramTotalBytes=unknown"));
   }
+#if defined(ARDUINO_ARCH_ESP32)
+  Serial.print(F(" resetReason="));
+  Serial.print((int)bridgeResetReason);
+  Serial.print(F(" heapLargestBytes="));
+  Serial.print((unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  Serial.print(F(" heapMinimumBytes="));
+  Serial.print((unsigned long)esp_get_minimum_free_heap_size());
+  if (previousBridgeTraceValid) {
+    Serial.print(F(" previousStage="));
+    Serial.print(bridgeStageName(previousBridgeTrace.stage));
+    Serial.print(F(" previousIndex="));
+    Serial.print(previousBridgeTrace.commandIndex);
+    Serial.print(F(" previousHeapBytes="));
+    Serial.print((unsigned long)previousBridgeTrace.freeHeap);
+    Serial.print(F(" previousLargestBytes="));
+    Serial.print((unsigned long)previousBridgeTrace.largestBlock);
+    Serial.print(F(" previousMinimumBytes="));
+    Serial.print((unsigned long)previousBridgeTrace.minimumFreeHeap);
+  }
+#endif
   Serial.println();
 }
 
@@ -3613,6 +4042,14 @@ void processSerialCommand(String command) {
   String rest = command;
   String operation = takeToken(rest);
   operation.toUpperCase();
+#if defined(ARDUINO_ARCH_ESP32)
+  // If a browser request itself stalls, the next STATUS identifies which
+  // request was in flight instead of reporting only the generic serial stage.
+  if (operation == "STATUS") markBridgeStage(BRIDGE_STAGE_SERIAL_STATUS);
+  else if (operation == "CAPS") markBridgeStage(BRIDGE_STAGE_SERIAL_CAPS);
+  else if (operation == "EXEC") markBridgeStage(BRIDGE_STAGE_SERIAL_EXEC);
+  else markBridgeStage(BRIDGE_STAGE_SERIAL_OTHER);
+#endif
 
   if (operation == "HELP") {
     if (rest.length() > 0) Serial.println(F("ERR HELP unexpected-arguments"));
@@ -3623,6 +4060,21 @@ void processSerialCommand(String command) {
   } else if (operation == "STATUS") {
     if (rest.length() > 0) Serial.println(F("ERR STATUS unexpected-arguments"));
     else printStatus();
+  } else if (operation == "LOGS") {
+    rest.trim();
+    rest.toUpperCase();
+    if (rest == "ON") {
+      runtimeLogsEnabled = true;
+      dot.setDiagnosticStream(&bridgeSerial);
+    } else if (rest == "OFF") {
+      runtimeLogsEnabled = false;
+      dot.setDiagnosticStream(nullptr);
+    }
+    else if (rest != "STATUS") {
+      Serial.println(F("ERR LOGS expected-ON-OFF-STATUS"));
+      return;
+    }
+    Serial.println(runtimeLogsEnabled ? F("LOGS ON") : F("LOGS OFF"));
   } else if (operation == "ADD") {
     addRuntimeCommand(rest);
   } else if (operation == "LIST") {
@@ -3687,32 +4139,44 @@ void processSerialCommand(String command) {
 }
 
 void serviceSerial() {
-  while (Serial.available() > 0) {
+  uint8_t bytesProcessed = 0;
+  while (bytesProcessed < MAX_SERIAL_BYTES_PER_PASS && Serial.available() > 0) {
     char character = (char)Serial.read();
+    ++bytesProcessed;
     if ((uint8_t)character == SERIAL_EMERGENCY_STOP) {
       emergencyStopRequested = true;
       pollEmergencyStop();
-      serialLine = String();
+      serialLineLength = 0;
+      serialLine[0] = '\0';
       serialLineOverflow = false;
-      continue;
+      break;
     }
     if (character == '\r') {
       continue;
     }
     if (character == '\n') {
+      serialLine[serialLineLength] = '\0';
+      // Every completed input line is a user/editor request, so its reply is
+      // visible even when autonomous diagnostics are disabled.
+      bridgeSerial.setOutputEnabled(true);
       if (serialLineOverflow) {
         Serial.println(F("ERR SERIAL line-too-long"));
       } else {
-        processSerialCommand(serialLine);
+        processSerialCommand(String(serialLine));
       }
-      serialLine = String();
+      if (rebootRequested) rebootRequestedFromSerial = true;
+      bridgeSerial.setOutputEnabled(runtimeLogsEnabled);
+      serialLineLength = 0;
+      serialLine[0] = '\0';
       serialLineOverflow = false;
-      if (rebootRequested) break;
+      // One complete request per loop pass prevents browser traffic from
+      // starving Wi-Fi, MQTT, the runtime and the task-watchdog feed.
+      break;
     } else if (!serialLineOverflow) {
-      if (serialLine.length() >= MAX_SERIAL_LINE_LENGTH) {
+      if (serialLineLength >= MAX_SERIAL_LINE_LENGTH) {
         serialLineOverflow = true;
       } else {
-        serialLine += character;
+        serialLine[serialLineLength++] = character;
       }
     }
   }
@@ -3720,6 +4184,15 @@ void serviceSerial() {
 
 void setup() {
   Serial.begin(115200);
+  limitBridgeUsbWriteWait();
+  dot.setDiagnosticStream(nullptr);
+#if defined(ARDUINO_ARCH_ESP32)
+  beginBridgeTrace();
+  sampleBridgeMemory();
+#endif
+  // Arm the native watchdog before peripheral and SD initialization too:
+  // a stuck I2C bus during boot must not leave the Bridge unresponsive.
+  beginBridgeTaskWatchdog();
   dot.begin();
 
   sdReady = dot.beginSD();
@@ -3749,7 +4222,19 @@ void setup() {
 }
 
 void loop() {
+  feedBridgeTaskWatchdog();
+#if defined(ARDUINO_ARCH_ESP32)
+  static unsigned long lastMemorySample = 0;
+  if (millis() - lastMemorySample >= 1000UL) {
+    lastMemorySample = millis();
+    sampleBridgeMemory();
+  }
+  markBridgeStage(BRIDGE_STAGE_SERIAL);
+#endif
   serviceSerial();
+#if defined(ARDUINO_ARCH_ESP32)
+  markBridgeStage(BRIDGE_STAGE_BUTTONS);
+#endif
   // Campiona gli edge prima delle attività potenzialmente lente (Wi-Fi/MQTT)
   // così un click breve resta disponibile per WAIT_BUTTON.
   serviceButtonEdges();
@@ -3757,7 +4242,19 @@ void loop() {
   // runtime sequence are serviced. This is required after WIFI/CLOUD BEGIN.
   // Poll MQTT before servicing a waiting CLOUD command so a packet received in
   // this loop is consumed immediately instead of waiting for the next tick.
+#if defined(ARDUINO_ARCH_ESP32)
+  markBridgeStage(BRIDGE_STAGE_NETWORK);
+#endif
   dot.run();
+#if defined(ARDUINO_ARCH_ESP32)
+  markBridgeStage(BRIDGE_STAGE_RUNTIME, runtimeIndex);
+#endif
   serviceRuntime();
+#if defined(ARDUINO_ARCH_ESP32)
+  markBridgeStage(BRIDGE_STAGE_REBOOT);
+#endif
   serviceDeviceReboot();
+#if defined(ARDUINO_ARCH_ESP32)
+  markBridgeStage(BRIDGE_STAGE_IDLE);
+#endif
 }
