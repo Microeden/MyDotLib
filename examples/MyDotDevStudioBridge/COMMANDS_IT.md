@@ -121,7 +121,7 @@ riavviare la sequenza dopo uno `STOP`.
 | Lunghezza di un comando | 96 caratteri |
 | Payload cifrato | 4096 byte |
 | Cicli `REPEAT` annidati | 8 |
-| Variabili runtime | 16 |
+| Variabili runtime | 48 |
 | Lunghezza nome variabile | 16 caratteri |
 | Lunghezza valore variabile | 64 caratteri |
 
@@ -151,6 +151,22 @@ BRIGHTNESS $SOIL
 La sostituzione avviene quando il comando viene eseguito, non quando viene
 aggiunto con `ADD`. In questo modo il valore letto da un sensore può essere
 riutilizzato nel resto della sequenza.
+
+Per calcolare un intero a partire da variabili, il valore di `SET` può iniziare
+con `=`. Sono supportati parentesi, numeri decimali o esadecimali e le
+operazioni `+`, `-`, `*`, `/` e `%`; le variabili vengono sostituite prima del
+calcolo. Senza `=`, `SET` continua a copiare il valore così com'è.
+
+```text
+SET KNOBRAW0 42
+SET KNOBRAW1 1
+SET KNOB_POSITION = $KNOBRAW0 + (256 * $KNOBRAW1)
+GET KNOB_POSITION
+```
+
+Il terzo comando calcola `298`, combinando i byte little-endian in un intero.
+Il risultato può essere usato da `IF_VAR`, da un comando di uscita o da un
+ulteriore `SET`.
 
 `VARS` produce un output delimitato da `BEGIN_VARS` e `END_VARS`:
 

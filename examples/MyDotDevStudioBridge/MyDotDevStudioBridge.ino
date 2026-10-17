@@ -98,6 +98,7 @@
 #include <Wire.h>
 #include <math.h>
 #include "microeden_secrets.h"
+#include "runtime_integer_expression.h"
 
 #if !defined(ARDUINO_ARCH_ESP32)
 // The portable Arduino SD library is a thin wrapper around SdFat.  Its
@@ -115,7 +116,7 @@ const uint16_t MAX_SERIAL_LINE_LENGTH = 192;
 // una lettura/scrittura della microSD è ancora in corso.
 const uint8_t SERIAL_EMERGENCY_STOP = 0x03;
 const uint8_t MAX_LOOP_DEPTH = 8;
-const uint8_t MAX_RUNTIME_VARIABLES = 16;
+const uint8_t MAX_RUNTIME_VARIABLES = 48;
 // Numero massimo di pin GPIO che il runtime può aver portato in uscita. È un
 // limite sui pin fisici, non sul numero di istruzioni del programma; basta a
 // coprire tutti i GPIO utilizzabili dalle schede Nano supportate.
@@ -2351,8 +2352,23 @@ bool executeRuntimeCommand(String command, bool allowDelay) {
 
   if (operation == "SET") {
     String name = takeToken(rest);
-    if (name.length() == 0 || rest.length() == 0 ||
-        !setRuntimeVariable(name, rest)) {
+    String value = rest;
+    value.trim();
+    if (name.length() == 0 || value.length() == 0) {
+      Serial.println(F("ERR RUNTIME SET expected-name-and-value"));
+      return false;
+    }
+    if (value.startsWith("=")) {
+      value.remove(0, 1);
+      value.trim();
+      long long calculated = 0;
+      if (!myDotEvaluateIntegerExpression(value, calculated)) {
+        Serial.println(F("ERR RUNTIME SET invalid-integer-expression"));
+        return false;
+      }
+      value = myDotIntegerToString(calculated);
+    }
+    if (!setRuntimeVariable(name, value)) {
       Serial.println(F("ERR RUNTIME SET expected-name-and-value"));
       return false;
     }

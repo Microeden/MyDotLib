@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.11
+
+- Increased the Dev Studio Bridge runtime variable capacity from 16 to 48.
+- Added checked integer expressions to `SET`, including parentheses, decimal
+  and hexadecimal literals, and `+`, `-`, `*`, `/`, and `%` operators.
+- Added Italian Bridge documentation for runtime expressions.
+
 ## 1.0.10
 
 - Allow Dev Studio Bridge `LEVEL` and `SLIDER` widget writes to forward

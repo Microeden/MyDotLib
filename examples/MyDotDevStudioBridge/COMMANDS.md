@@ -122,7 +122,7 @@ to retry or reload the file manually, and `RUN` can restart the sequence after
 | Command length | 96 characters |
 | Encrypted script payload | 4096 bytes |
 | Nested `REPEAT` blocks | 8 |
-| Runtime variables | 16 |
+| Runtime variables | 48 |
 | Variable name length | 16 characters |
 | Variable value length | 64 characters |
 
@@ -152,6 +152,22 @@ BRIGHTNESS $SOIL
 references are expanded when a runtime command is executed, not when it is
 added. This permits a value read from a sensor to be reused later in the same
 sequence.
+
+To calculate an integer from runtime variables, start the `SET` value with
+`=`. Parentheses, decimal or hexadecimal numbers, and the operators `+`, `-`,
+`*`, `/` and `%` are supported; variables are expanded before evaluation.
+Without `=`, `SET` keeps copying the value as text.
+
+```text
+SET KNOBRAW0 42
+SET KNOBRAW1 1
+SET KNOB_POSITION = $KNOBRAW0 + (256 * $KNOBRAW1)
+GET KNOB_POSITION
+```
+
+The third command calculates `298`, combining the two little-endian bytes into
+an integer. The result can be used by `IF_VAR`, an output command or another
+`SET`.
 
 `VARS` prints:
 
