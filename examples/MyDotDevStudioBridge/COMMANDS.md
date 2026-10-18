@@ -105,7 +105,8 @@ capacity (`cardSize()`); `sdTotalBytes` is the usable filesystem capacity.
 Resource sizes are reported when the selected board exposes the corresponding
 API; otherwise their value is `unknown`.
 
-On ESP32, `STATUS` also reports `resetReason`, `heapLargestBytes` and
+On ESP32, `STATUS` also reports `taskWatchdog` (`ready` or `unavailable`),
+`resetReason`, `heapLargestBytes` and
 `heapMinimumBytes`. After a warm reboot it includes `previousStage`,
 `previousIndex`, `previousHeapBytes`, `previousLargestBytes` and
 `previousMinimumBytes`, captured
@@ -323,6 +324,18 @@ and never connect an I²C device above the board's logic voltage.
 
 Control-flow commands are executed inside a sequence started with `RUN`.
 `EXEC` rejects them because it has no sequence cursor or loop stack.
+
+The Dev Studio can compile disconnected chains as cooperative tasks. Each task
+keeps its own program counter, timer, and wait state, so `DELAY` and
+`WAIT_BUTTON` pause only the chain that contains them while the bridge services
+the others. A connected chain remains one task; the true and false paths of
+`IF_VAR` or `IF_BUTTON` stay mutually exclusive. The Dev Studio generates the
+internal `TASK BEGIN ONCE|LOOP` and `TASK END` markers; they are not palette
+blocks. Saved programs without these markers keep the previous linear behavior.
+Tasks may jump to a shared manual flow outside the `TASK` sections. When that
+flow returns to the compiler-generated continuous-loop label, its calling
+`ONCE` task finishes or its calling `LOOP` task restarts; the destination loop
+is already running independently. Jumping into another task's body is invalid.
 
 ### Labels and jumps
 

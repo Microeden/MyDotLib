@@ -2,6 +2,7 @@
 
 #if defined(ARDUINO_ARCH_ESP32)
 #include "MyDotRootCA.h"
+#include <esp_arduino_version.h>
 #endif
 
 // Arduino's common API intentionally does not standardise runtime RAM
@@ -318,6 +319,16 @@ void MyDot::beginCloud(const char* deviceId, const char* token) {
 #if defined(ARDUINO_ARCH_ESP32)
   // Use certificate validation rather than insecure TLS connections.
   _netClient.setCACert(MYDOT_ROOT_CA);
+  // PubSubClient::setSocketTimeout() bounds its MQTT reads, not the secure
+  // client's TLS write. The ESP32 client otherwise defaults to 30 seconds,
+  // longer than the Bridge task watchdog. Select by Arduino core version,
+  // not ESP-IDF version: Nano ESP32's Arduino 2.x core uses ESP-IDF 5.x.
+  // Arduino-ESP32 2.x accepts seconds; 3.x accepts milliseconds.
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  _netClient.setConnectionTimeout(3000);
+#else
+  _netClient.setTimeout(3);
+#endif
 #endif
 
   _mqtt.setServer("microeden.io", 8243);

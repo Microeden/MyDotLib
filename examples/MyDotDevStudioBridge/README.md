@@ -87,6 +87,11 @@ Use `EXEC <command>` for an immediate operation. `RUN` is non-blocking:
 reconnection remain active while a sequence is running. `STOP` halts the
 sequence and switches off the relay, fan and pixels.
 
+Programs compiled by a parallel-task-capable Dev Studio can contain multiple
+disconnected chains. Their waits are independent: a `DELAY` in one chain does
+not pause commands in another. A single connected chain still runs in order,
+and conditional true/false paths remain mutually exclusive.
+
 The Dev Studio also has a priority USB control lane: it sends the single byte
 ETX (`0x03`) for an emergency stop. The bridge checks this byte while reading
 or writing the microSD and while the runtime is active, so STOP does not wait

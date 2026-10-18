@@ -162,6 +162,7 @@ const char* RUNTIME_FILE = "/MyDot.run";
 const uint16_t MAX_COMMAND_LENGTH = 96;
 const uint16_t MAX_RUNTIME_BYTES = 4096;
 const uint16_t MAX_SERIAL_LINE_LENGTH = 192;
+const uint8_t MAX_RUNTIME_TASKS = 16;
 // A browser can queue commands faster than they can be executed. Bound USB
 // receive work so the network and resident runtime still get CPU time.
 const uint8_t MAX_SERIAL_BYTES_PER_PASS = 96;
@@ -210,6 +211,29 @@ struct RuntimeLoopFrame {
 };
 RuntimeLoopFrame runtimeLoopStack[MAX_LOOP_DEPTH];
 uint8_t runtimeLoopDepth = 0;
+struct RuntimeTaskState {
+  bool active;
+  bool repeating;
+  uint16_t startIndex;
+  uint16_t endIndex;
+  uint16_t index;
+  unsigned long waitUntil;
+  RuntimeLoopFrame loopStack[MAX_LOOP_DEPTH];
+  uint8_t loopDepth;
+  bool waitingForButton;
+  uint8_t waitButton;
+  bool waitForClick;
+  bool waitHasTimeout;
+  unsigned long buttonWaitUntil;
+  bool buttonAClickPending;
+  bool buttonBClickPending;
+  bool waitingForCloudCommand;
+  String cloudExpectedCommand;
+};
+RuntimeTaskState runtimeTasks[MAX_RUNTIME_TASKS];
+uint8_t runtimeTaskCount = 0;
+uint8_t runtimeTaskCursor = 0;
+uint8_t runtimeCurrentTask = 0xFF;
 struct RuntimeVariable {
   String name;
   String value;
@@ -261,7 +285,8 @@ enum BridgeStage : uint8_t {
   BRIDGE_STAGE_SERIAL_STATUS,
   BRIDGE_STAGE_SERIAL_CAPS,
   BRIDGE_STAGE_SERIAL_EXEC,
-  BRIDGE_STAGE_SERIAL_OTHER
+  BRIDGE_STAGE_SERIAL_OTHER,
+  BRIDGE_STAGE_WIDGET_PUBLISH
 };
 struct BridgeTrace {
   uint32_t magic;
@@ -311,6 +336,7 @@ const char* bridgeStageName(uint8_t stage) {
     case BRIDGE_STAGE_SERIAL_CAPS: return "serial-caps";
     case BRIDGE_STAGE_SERIAL_EXEC: return "serial-exec";
     case BRIDGE_STAGE_SERIAL_OTHER: return "serial-other";
+    case BRIDGE_STAGE_WIDGET_PUBLISH: return "widget-publish";
     default: return "unknown";
   }
 }
@@ -572,7 +598,7 @@ void printHelp() {
 }
 
 void printCapabilities() {
-  Serial.println(F("CAPS VERSION 2"));
+  Serial.println(F("CAPS VERSION 3"));
   Serial.println(F("CAPS CONTROL emergencyStop=ETX"));
   Serial.print(F("CAPS BOARD name="));
   Serial.println(currentBoardName());
@@ -592,6 +618,8 @@ void printCapabilities() {
   Serial.println(dot.rebootSupported() ? F("supported") : F("unavailable"));
   Serial.print(F("CAPS FEATURE watchdog="));
   Serial.println(dot.rebootSupported() ? F("cooperative") : F("unavailable"));
+  Serial.println(F("CAPS FEATURE parallelTasks=supported"));
+  Serial.println(F("CAPS FEATURE runtimeTasks=16"));
   Serial.print(F("CAPS PINS "));
   Serial.println(F(MYDOT_PIN_MAP_NAME));
   Serial.println(F("CAPS TOPLEVEL HELP CAPS STATUS LOGS ADD LIST CLEAR SAVE LOAD RUN STOP REBOOT EXEC"));
@@ -1114,8 +1142,18 @@ void stopRuntimeOutputs() {
 void resetRuntimeControlState();
 
 void serviceButtonEdges() {
-  if (dot.isButtonAClicked()) runtimeButtonAClickPending = true;
-  if (dot.isButtonBClicked()) runtimeButtonBClickPending = true;
+  if (dot.isButtonAClicked()) {
+    runtimeButtonAClickPending = true;
+    for (uint8_t index = 0; index < runtimeTaskCount; ++index) {
+      if (runtimeTasks[index].active) runtimeTasks[index].buttonAClickPending = true;
+    }
+  }
+  if (dot.isButtonBClicked()) {
+    runtimeButtonBClickPending = true;
+    for (uint8_t index = 0; index < runtimeTaskCount; ++index) {
+      if (runtimeTasks[index].active) runtimeTasks[index].buttonBClickPending = true;
+    }
+  }
 }
 
 void stopRuntime() {
@@ -1165,6 +1203,8 @@ bool parseBooleanToken(String token, bool& value) {
 }
 
 void resetRuntimeControlState() {
+  runtimeIndex = 0;
+  runtimeWaitUntil = 0;
   runtimeLoopDepth = 0;
   runtimeWaitingForButton = false;
   runtimeWaitButton = 0;
@@ -1175,6 +1215,176 @@ void resetRuntimeControlState() {
   runtimeButtonBClickPending = false;
   runtimeWaitingForCloudCommand = false;
   runtimeCloudExpectedCommand = String();
+  runtimeTaskCount = 0;
+  runtimeTaskCursor = 0;
+  runtimeCurrentTask = 0xFF;
+  for (uint8_t index = 0; index < MAX_RUNTIME_TASKS; ++index) {
+    runtimeTasks[index].active = false;
+    runtimeTasks[index].repeating = false;
+    runtimeTasks[index].startIndex = 0;
+    runtimeTasks[index].endIndex = 0;
+    runtimeTasks[index].index = 0;
+    runtimeTasks[index].waitUntil = 0;
+    runtimeTasks[index].loopDepth = 0;
+    runtimeTasks[index].waitingForButton = false;
+    runtimeTasks[index].waitButton = 0;
+    runtimeTasks[index].waitForClick = false;
+    runtimeTasks[index].waitHasTimeout = false;
+    runtimeTasks[index].buttonWaitUntil = 0;
+    runtimeTasks[index].buttonAClickPending = false;
+    runtimeTasks[index].buttonBClickPending = false;
+    runtimeTasks[index].waitingForCloudCommand = false;
+    runtimeTasks[index].cloudExpectedCommand = String();
+  }
+}
+
+bool initializeRuntimeTasks() {
+  resetRuntimeControlState();
+  bool hasTaskMarkers = false;
+  for (uint16_t index = 0; index < runtimeCommandCount; ++index) {
+    String command = runtimeCommandAt(index);
+    if (takeToken(command).equalsIgnoreCase("TASK")) {
+      hasTaskMarkers = true;
+      break;
+    }
+  }
+
+  if (!hasTaskMarkers) {
+    runtimeTaskCount = 1;
+    runtimeTasks[0].active = runtimeCommandCount > 0;
+    runtimeTasks[0].repeating = false;
+    runtimeTasks[0].startIndex = 0;
+    runtimeTasks[0].endIndex = runtimeCommandCount;
+    runtimeTasks[0].index = 0;
+    runtimeRunning = runtimeTasks[0].active;
+    return runtimeRunning;
+  }
+
+  bool insideTask = false;
+  uint16_t taskStart = 0;
+  bool repeating = false;
+  for (uint16_t index = 0; index < runtimeCommandCount; ++index) {
+    String command = runtimeCommandAt(index);
+    String operation = takeToken(command);
+    operation.toUpperCase();
+    if (operation != "TASK") continue;
+    String action = takeToken(command);
+    action.toUpperCase();
+    if (action == "BEGIN") {
+      String mode = takeToken(command);
+      mode.toUpperCase();
+      if (insideTask || command.length() > 0 || (mode != "AUTO" && mode != "ONCE" && mode != "LOOP")) {
+        Serial.println(F("ERR RUN malformed-task-begin"));
+        runtimeTaskCount = 0;
+        return false;
+      }
+      if (runtimeTaskCount >= MAX_RUNTIME_TASKS) {
+        Serial.println(F("ERR RUN task-limit-exceeded"));
+        runtimeTaskCount = 0;
+        return false;
+      }
+      insideTask = true;
+      repeating = mode == "LOOP";
+      taskStart = index + 1;
+      continue;
+    }
+    if (action == "END") {
+      if (!insideTask || command.length() > 0) {
+        Serial.println(F("ERR RUN malformed-task-end"));
+        runtimeTaskCount = 0;
+        return false;
+      }
+      RuntimeTaskState& task = runtimeTasks[runtimeTaskCount++];
+      task.active = true;
+      task.repeating = repeating;
+      task.startIndex = taskStart;
+      task.endIndex = index;
+      task.index = taskStart;
+      task.waitUntil = 0;
+      task.loopDepth = 0;
+      task.waitingForButton = false;
+      task.waitButton = 0;
+      task.waitForClick = false;
+      task.waitHasTimeout = false;
+      task.buttonWaitUntil = 0;
+      task.buttonAClickPending = false;
+      task.buttonBClickPending = false;
+      task.waitingForCloudCommand = false;
+      task.cloudExpectedCommand = String();
+      insideTask = false;
+      continue;
+    }
+    Serial.println(F("ERR RUN malformed-task-command"));
+    runtimeTaskCount = 0;
+    return false;
+  }
+  if (insideTask || runtimeTaskCount == 0) {
+    Serial.println(F("ERR RUN malformed-task-sequence"));
+    runtimeTaskCount = 0;
+    return false;
+  }
+  runtimeTaskCursor = 0;
+  runtimeRunning = true;
+  return true;
+}
+
+// Commands between TASK sections are shared manual flows generated by Dev
+// Studio. They are not scheduled on their own, but a running task may jump to
+// one of their labels. Keep task bodies and TASK markers distinct so such a
+// jump cannot accidentally execute a second task with the caller's context.
+int8_t runtimeCommandOwner(uint16_t index) {
+  if (index >= runtimeCommandCount) return -2;
+  for (uint8_t taskIndex = 0; taskIndex < runtimeTaskCount; ++taskIndex) {
+    const RuntimeTaskState& task = runtimeTasks[taskIndex];
+    if (index >= task.startIndex && index < task.endIndex) return (int8_t)taskIndex;
+    if (index == task.endIndex ||
+        (task.startIndex > 0 && index == task.startIndex - 1)) return -2;
+  }
+  return -1;
+}
+
+uint16_t runtimeRegionEnd(uint16_t index) {
+  if (runtimeCurrentTask == 0xFF || runtimeCurrentTask >= runtimeTaskCount) {
+    return runtimeCommandCount;
+  }
+  if (runtimeCommandOwner(index) != -1) {
+    return runtimeTasks[runtimeCurrentTask].endIndex;
+  }
+  // A REPEAT or legacy Cloud wait inside a manual flow may inspect the rest
+  // of that flow, but must stop before the next TASK section.
+  while (index < runtimeCommandCount && runtimeCommandOwner(index) == -1) ++index;
+  return index;
+}
+
+void loadRuntimeTaskContext(uint8_t taskIndex) {
+  RuntimeTaskState& task = runtimeTasks[taskIndex];
+  runtimeCurrentTask = taskIndex;
+  runtimeIndex = task.index;
+  runtimeWaitUntil = task.waitUntil;
+  memcpy(runtimeLoopStack, task.loopStack, sizeof(runtimeLoopStack));
+  runtimeLoopDepth = task.loopDepth;
+  runtimeWaitingForButton = task.waitingForButton;
+  runtimeWaitButton = task.waitButton;
+  runtimeWaitForClick = task.waitForClick;
+  runtimeWaitHasTimeout = task.waitHasTimeout;
+  runtimeButtonWaitUntil = task.buttonWaitUntil;
+  runtimeWaitingForCloudCommand = task.waitingForCloudCommand;
+  runtimeCloudExpectedCommand = task.cloudExpectedCommand;
+}
+
+void saveRuntimeTaskContext(uint8_t taskIndex) {
+  RuntimeTaskState& task = runtimeTasks[taskIndex];
+  task.index = runtimeIndex;
+  task.waitUntil = runtimeWaitUntil;
+  memcpy(task.loopStack, runtimeLoopStack, sizeof(runtimeLoopStack));
+  task.loopDepth = runtimeLoopDepth;
+  task.waitingForButton = runtimeWaitingForButton;
+  task.waitButton = runtimeWaitButton;
+  task.waitForClick = runtimeWaitForClick;
+  task.waitHasTimeout = runtimeWaitHasTimeout;
+  task.buttonWaitUntil = runtimeButtonWaitUntil;
+  task.waitingForCloudCommand = runtimeWaitingForCloudCommand;
+  task.cloudExpectedCommand = runtimeCloudExpectedCommand;
 }
 
 void requestDeviceReboot() {
@@ -1228,6 +1438,11 @@ bool parseButtonCondition(String& text, uint8_t& button, bool& click) {
 bool buttonCondition(uint8_t button, bool click) {
   if (button == 0) {
     if (click) {
+      if (runtimeCurrentTask != 0xFF && runtimeCurrentTask < runtimeTaskCount) {
+        const bool result = runtimeTasks[runtimeCurrentTask].buttonAClickPending;
+        runtimeTasks[runtimeCurrentTask].buttonAClickPending = false;
+        return result;
+      }
       const bool result = runtimeButtonAClickPending;
       runtimeButtonAClickPending = false;
       return result;
@@ -1235,6 +1450,11 @@ bool buttonCondition(uint8_t button, bool click) {
     return dot.isButtonAPressed();
   }
   if (click) {
+    if (runtimeCurrentTask != 0xFF && runtimeCurrentTask < runtimeTaskCount) {
+      const bool result = runtimeTasks[runtimeCurrentTask].buttonBClickPending;
+      runtimeTasks[runtimeCurrentTask].buttonBClickPending = false;
+      return result;
+    }
     const bool result = runtimeButtonBClickPending;
     runtimeButtonBClickPending = false;
     return result;
@@ -1262,7 +1482,8 @@ int findRuntimeLabel(const String& requestedLabel) {
 
 int findMatchingEndRepeat(uint16_t repeatIndex) {
   uint8_t nesting = 0;
-  for (uint16_t index = repeatIndex; index < runtimeCommandCount; ++index) {
+  const uint16_t limit = runtimeRegionEnd(repeatIndex);
+  for (uint16_t index = repeatIndex; index < limit; ++index) {
     String command = runtimeCommandAt(index);
     String operation = takeToken(command);
     operation.toUpperCase();
@@ -1287,6 +1508,22 @@ bool jumpToRuntimeLabel(String label) {
     Serial.print(F("ERR RUNTIME label-not-found "));
     Serial.println(label);
     return false;
+  }
+  if (runtimeCurrentTask != 0xFF && runtimeCurrentTask < runtimeTaskCount) {
+    const int8_t owner = runtimeCommandOwner((uint16_t)target);
+    if (owner >= 0 && owner != (int8_t)runtimeCurrentTask) {
+      // The compiler ends a manual flow with GOTO to the first continuous
+      // task. That task is already scheduled independently: finish a ONCE
+      // caller or restart a LOOP caller instead of running it twice.
+      const RuntimeTaskState& destination = runtimeTasks[(uint8_t)owner];
+      if (destination.repeating && (uint16_t)target == destination.startIndex) {
+        runtimeIndex = runtimeTasks[runtimeCurrentTask].endIndex;
+        runtimeLoopDepth = 0;
+        return true;
+      }
+      Serial.println(F("ERR RUNTIME label-in-another-task"));
+      return false;
+    }
   }
   // A jump leaving one or more active repeat blocks unwinds those frames so a
   // later ENDREPEAT cannot accidentally operate on stale loop state. Jumps
@@ -1339,7 +1576,8 @@ bool routeCloudCommandWhileWaiting(String& expectedCommand, bool waitingForCloud
   // viene consumato qui e l'indice viene portato al primo comando del ramo
   // successivo; in questo modo un vecchio listener non viene eseguito una
   // seconda volta da executeRuntimeCommand().
-  for (uint16_t index = runtimeIndex; index < runtimeCommandCount; ++index) {
+  const uint16_t scanLimit = runtimeRegionEnd(runtimeIndex);
+  for (uint16_t index = runtimeIndex; index < scanLimit; ++index) {
     String candidate = runtimeCommandAt(index);
     String operation = takeToken(candidate);
     operation.toUpperCase();
@@ -2195,7 +2433,17 @@ bool executeWidgetCommand(String rest) {
   // A visual "send to My Microeden" block must publish its value, not only
   // add it to the local JSON buffer. A failed publish leaves the payload in
   // MyDot for the next write or CLOUD SEND after MQTT reconnects.
+#if defined(ARDUINO_ARCH_ESP32)
+  if (runtimeCurrentTask != 0xFF && runtimeRunning) {
+    markBridgeStage(BRIDGE_STAGE_WIDGET_PUBLISH, runtimeIndex - 1);
+  }
+#endif
   const bool published = dot.sendCloud();
+#if defined(ARDUINO_ARCH_ESP32)
+  if (runtimeCurrentTask != 0xFF && runtimeRunning) {
+    markBridgeStage(BRIDGE_STAGE_COMMAND, runtimeIndex - 1);
+  }
+#endif
   Serial.println(F("OK WIDGET WRITE"));
   if (!published) Serial.println(F("WARN CLOUD SEND deferred"));
   return true;
@@ -3537,86 +3785,134 @@ void serviceRuntime() {
     return;
   }
 
-  // Prima di rispettare un'attesa legacy proviamo a consegnare eventuali
-  // comandi Cloud già arrivati. Nei programmi recenti questo percorso non
-  // viene usato perché gli ascoltatori hanno la continuazione GOTO e sono
-  // cooperativi per definizione.
-  if (runtimeWaitingForButton || runtimeWaitingForCloudCommand) {
-    String expected = runtimeCloudExpectedCommand;
-    if (routeCloudCommandWhileWaiting(expected, runtimeWaitingForCloudCommand)) {
-      // Se il comando ha instradato un ramo con GOTO, il nuovo indice è già
-      // pronto; altrimenti continueremo dal comando successivo al listener.
-    }
-  }
-
-  if (runtimeWaitingForCloudCommand) {
-    if (dot.onCommand(runtimeCloudExpectedCommand.c_str())) {
-      runtimeWaitingForCloudCommand = false;
-      runtimeCloudExpectedCommand = String();
-      Serial.println(F("INFO CLOUD ON_COMMAND triggered"));
-    } else {
-      return;
-    }
-  }
-
-  if (runtimeWaitingForButton) {
-    if (buttonCondition(runtimeWaitButton, runtimeWaitForClick)) {
-      runtimeWaitingForButton = false;
-      runtimeWaitHasTimeout = false;
-      runtimeButtonWaitUntil = 0;
-      Serial.println(F("INFO WAIT_BUTTON triggered"));
-    } else if (runtimeWaitHasTimeout &&
-               (long)(millis() - runtimeButtonWaitUntil) >= 0) {
-      runtimeWaitingForButton = false;
-      runtimeWaitHasTimeout = false;
-      runtimeButtonWaitUntil = 0;
-      Serial.println(F("INFO WAIT_BUTTON timeout"));
-    } else {
-      return;
-    }
-  }
-
-  if (runtimeWaitUntil != 0 && (long)(millis() - runtimeWaitUntil) < 0) {
+  if (runtimeTaskCount == 0 && !initializeRuntimeTasks()) {
+    runtimeRunning = false;
     return;
   }
-  runtimeWaitUntil = 0;
 
-  if (runtimeIndex >= runtimeCommandCount) {
+  const uint32_t now = millis();
+  for (uint8_t offset = 0; offset < runtimeTaskCount; ++offset) {
+    const uint8_t taskIndex = (uint8_t)((runtimeTaskCursor + offset) % runtimeTaskCount);
+    RuntimeTaskState& task = runtimeTasks[taskIndex];
+    if (!task.active) continue;
+    loadRuntimeTaskContext(taskIndex);
+
+    // Ogni attività conserva le proprie attese e lo stack dei cicli. Una
+    // scadenza futura o un pulsante non premuto mette in pausa solo questa
+    // attività; il ciclo continua a cercare un'altra attività pronta.
+    if (runtimeWaitingForButton || runtimeWaitingForCloudCommand) {
+      String expected = runtimeCloudExpectedCommand;
+      routeCloudCommandWhileWaiting(expected, runtimeWaitingForCloudCommand);
+    }
+    if (runtimeWaitingForCloudCommand) {
+      if (dot.onCommand(runtimeCloudExpectedCommand.c_str())) {
+        runtimeWaitingForCloudCommand = false;
+        runtimeCloudExpectedCommand = String();
+        Serial.println(F("INFO CLOUD ON_COMMAND triggered"));
+      } else {
+        saveRuntimeTaskContext(taskIndex);
+        continue;
+      }
+    }
+    if (runtimeWaitingForButton) {
+      if (buttonCondition(runtimeWaitButton, runtimeWaitForClick)) {
+        runtimeWaitingForButton = false;
+        runtimeWaitHasTimeout = false;
+        runtimeButtonWaitUntil = 0;
+        Serial.println(F("INFO WAIT_BUTTON triggered"));
+      } else if (runtimeWaitHasTimeout &&
+                 (long)(millis() - runtimeButtonWaitUntil) >= 0) {
+        runtimeWaitingForButton = false;
+        runtimeWaitHasTimeout = false;
+        runtimeButtonWaitUntil = 0;
+        Serial.println(F("INFO WAIT_BUTTON timeout"));
+      } else {
+        saveRuntimeTaskContext(taskIndex);
+        continue;
+      }
+    }
+
+    if (runtimeWaitUntil != 0 && (long)(now - runtimeWaitUntil) < 0) {
+      saveRuntimeTaskContext(taskIndex);
+      continue;
+    }
+    runtimeWaitUntil = 0;
+
+    const int8_t commandOwner = runtimeCommandOwner(runtimeIndex);
+    if (commandOwner != (int8_t)taskIndex && commandOwner != -1) {
+      if (runtimeIndex != task.endIndex) {
+        // Reaching another task or a TASK marker is not a valid fallthrough.
+        runtimeRunning = false;
+        resetRuntimeControlState();
+        stopRuntimeOutputs();
+        Serial.println(F("ERR RUN task-boundary"));
+        return;
+      }
+      if (task.repeating) {
+        runtimeIndex = task.startIndex;
+        runtimeLoopDepth = 0;
+        runtimeWaitingForButton = false;
+        runtimeWaitHasTimeout = false;
+        runtimeButtonWaitUntil = 0;
+        runtimeWaitingForCloudCommand = false;
+        runtimeCloudExpectedCommand = String();
+        saveRuntimeTaskContext(taskIndex);
+        continue;
+      }
+      task.active = false;
+      saveRuntimeTaskContext(taskIndex);
+      continue;
+    }
+
+    String command = runtimeCommandAt(runtimeIndex);
+    ++runtimeIndex;
+    runtimeTransientFailure = false;
+#if defined(ARDUINO_ARCH_ESP32)
+    markBridgeStage(BRIDGE_STAGE_COMMAND, runtimeIndex - 1);
+#endif
+    const bool previousOutput = bridgeSerial.isOutputEnabled();
+    bridgeSerial.setOutputEnabled(runtimeLogsEnabled || isExplicitSerialCommand(command));
+    const bool commandSucceeded = executeRuntimeCommand(command, true);
+    bridgeSerial.setOutputEnabled(previousOutput);
+    if (!commandSucceeded) {
+      if (runtimeTransientFailure) {
+        // Sensor, I2C and MQTT outages only delay the activity that issued
+        // the command; other activities remain runnable on the next pass.
+        runtimeWaitUntil = millis() + 250;
+        saveRuntimeTaskContext(taskIndex);
+        runtimeTaskCursor = (uint8_t)((taskIndex + 1) % runtimeTaskCount);
+        Serial.println(F("WARN RUN temporary I/O failure; continuing"));
+        return;
+      }
+      const uint16_t stoppedIndex = runtimeIndex == 0 ? 0 : runtimeIndex - 1;
+      runtimeRunning = false;
+      resetRuntimeControlState();
+      stopRuntimeOutputs();
+      Serial.println(F("ERR RUN stopped"));
+      Serial.print(F("INFO RUN stopped-index="));
+      Serial.println(stoppedIndex);
+      return;
+    }
+    if (!runtimeRunning || runtimeTaskCount == 0) return;
+    saveRuntimeTaskContext(taskIndex);
+    runtimeTaskCursor = (uint8_t)((taskIndex + 1) % runtimeTaskCount);
+    return;
+  }
+
+  bool anyActive = false;
+  for (uint8_t index = 0; index < runtimeTaskCount; ++index) {
+    if (runtimeTasks[index].active) {
+      anyActive = true;
+      break;
+    }
+  }
+  if (!anyActive) {
     runtimeRunning = false;
     resetRuntimeControlState();
-    // La fine naturale della sequenza deve avere lo stesso comportamento di
-    // STOP: nessuna uscita o contenuto del display deve restare attivo dopo
-    // l'ultima istruzione eseguita.
+    // Le uscite si spengono solo quando sono terminate tutte le attività
+    // una tantum; la conclusione di una catena non ferma le altre.
     stopRuntimeOutputs();
     Serial.println(F("OK COMPLETE"));
-    return;
-  }
-
-  String command = runtimeCommandAt(runtimeIndex);
-  ++runtimeIndex;
-  runtimeTransientFailure = false;
-#if defined(ARDUINO_ARCH_ESP32)
-  markBridgeStage(BRIDGE_STAGE_COMMAND, runtimeIndex - 1);
-#endif
-  const bool previousOutput = bridgeSerial.isOutputEnabled();
-  bridgeSerial.setOutputEnabled(runtimeLogsEnabled || isExplicitSerialCommand(command));
-  const bool commandSucceeded = executeRuntimeCommand(command, true);
-  bridgeSerial.setOutputEnabled(previousOutput);
-  if (!commandSucceeded) {
-    if (runtimeTransientFailure) {
-      // Sensor, I2C and MQTT outages can clear without changing the saved
-      // program. Let the rest of the loop run so reconnection and Serial
-      // remain responsive; sendCloud() keeps unsent telemetry buffered.
-      runtimeWaitUntil = millis() + 250;
-      Serial.println(F("WARN RUN temporary I/O failure; continuing"));
-      return;
-    }
-    runtimeRunning = false;
-    resetRuntimeControlState();
-    stopRuntimeOutputs();
-    Serial.println(F("ERR RUN stopped"));
-    Serial.print(F("INFO RUN stopped-index="));
-    Serial.println(runtimeIndex - 1);
   }
 }
 
@@ -3910,6 +4206,22 @@ const char* currentBoardName() {
 #endif
 }
 
+bool runtimeAnyTaskWaitingForButton() {
+  if (runtimeTaskCount == 0) return runtimeWaitingForButton;
+  for (uint8_t index = 0; index < runtimeTaskCount; ++index) {
+    if (runtimeTasks[index].active && runtimeTasks[index].waitingForButton) return true;
+  }
+  return false;
+}
+
+bool runtimeAnyTaskWaitingForCloud() {
+  if (runtimeTaskCount == 0) return runtimeWaitingForCloudCommand;
+  for (uint8_t index = 0; index < runtimeTaskCount; ++index) {
+    if (runtimeTasks[index].active && runtimeTasks[index].waitingForCloudCommand) return true;
+  }
+  return false;
+}
+
 void printStatus() {
   Serial.print(F("STATUS sd="));
   Serial.print(sdReady ? F("ready") : F("unavailable"));
@@ -3925,10 +4237,12 @@ void printStatus() {
   Serial.print(runtimeLogsEnabled ? F("on") : F("off"));
   Serial.print(F(" running="));
   Serial.print(runtimeRunning ? F("true") : F("false"));
+  Serial.print(F(" tasks="));
+  Serial.print(runtimeTaskCount);
   Serial.print(F(" waitingButton="));
-  Serial.print(runtimeWaitingForButton ? F("true") : F("false"));
+  Serial.print(runtimeAnyTaskWaitingForButton() ? F("true") : F("false"));
   Serial.print(F(" waitingCloud="));
-  Serial.print(runtimeWaitingForCloudCommand ? F("true") : F("false"));
+  Serial.print(runtimeAnyTaskWaitingForCloud() ? F("true") : F("false"));
   Serial.print(F(" loopDepth="));
   Serial.print(runtimeLoopDepth);
   Serial.print(F(" index="));
@@ -4011,6 +4325,8 @@ void printStatus() {
     Serial.print(F(" ramFreeBytes=unknown ramTotalBytes=unknown"));
   }
 #if defined(ARDUINO_ARCH_ESP32)
+  Serial.print(F(" taskWatchdog="));
+  Serial.print(bridgeTaskWatchdogReady ? F("ready") : F("unavailable"));
   Serial.print(F(" resetReason="));
   Serial.print((int)bridgeResetReason);
   Serial.print(F(" heapLargestBytes="));
@@ -4113,12 +4429,10 @@ void processSerialCommand(String command) {
     }
     if (runtimeCommandCount == 0) {
       Serial.println(F("ERR RUN empty-sequence"));
-    } else {
-      runtimeRunning = true;
-      runtimeIndex = 0;
-      runtimeWaitUntil = 0;
-      resetRuntimeControlState();
+    } else if (initializeRuntimeTasks()) {
       Serial.println(F("OK RUN"));
+    } else {
+      runtimeRunning = false;
     }
   } else if (operation == "STOP") {
     if (rest.length() > 0) Serial.println(F("ERR STOP unexpected-arguments"));
@@ -4129,8 +4443,12 @@ void processSerialCommand(String command) {
   } else if (operation == "EXEC") {
     if (rest.length() == 0) {
       Serial.println(F("ERR EXEC missing-command"));
-    } else if (executeRuntimeCommand(rest, false)) {
-      Serial.println(F("OK EXEC"));
+    } else {
+      const uint8_t previousRuntimeTask = runtimeCurrentTask;
+      runtimeCurrentTask = 0xFF;
+      const bool executed = executeRuntimeCommand(rest, false);
+      runtimeCurrentTask = runtimeRunning && runtimeTaskCount > 0 ? previousRuntimeTask : 0xFF;
+      if (executed) Serial.println(F("OK EXEC"));
     }
   } else {
     Serial.print(F("ERR UNKNOWN "));
@@ -4206,11 +4524,8 @@ void setup() {
         // A saved runtime is the user's resident program: after a power cycle
         // restore it and start it automatically. RUN remains available for
         // manual restarts, while STOP can still halt it at any time.
-        runtimeRunning = true;
-        runtimeIndex = 0;
-        runtimeWaitUntil = 0;
-        resetRuntimeControlState();
-        Serial.println(F("INFO runtime auto-start"));
+        if (initializeRuntimeTasks()) Serial.println(F("INFO runtime auto-start"));
+        else Serial.println(F("WARN runtime task sequence invalid; use RUN to retry"));
       }
     }
   } else {

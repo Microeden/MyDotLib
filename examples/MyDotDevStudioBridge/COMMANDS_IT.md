@@ -114,7 +114,8 @@ fisica della scheda (`cardSize()`); `sdTotalBytes` è la capacità utilizzabile
 del filesystem. Le dimensioni vengono restituite quando la scheda espone
 l’API corrispondente; altrimenti il valore è `unknown`.
 
-Su ESP32, `STATUS` mostra anche `resetReason`, `heapLargestBytes` e
+Su ESP32, `STATUS` mostra anche `taskWatchdog` (`ready` oppure `unavailable`),
+`resetReason`, `heapLargestBytes` e
 `heapMinimumBytes`. Dopo un riavvio non dovuto a spegnimento include
 `previousStage`, `previousIndex`, `previousHeapBytes`,
 `previousLargestBytes` e `previousMinimumBytes`, registrati senza scrivere
@@ -330,6 +331,20 @@ superiore a quella supportata dalla scheda.
 
 I comandi di controllo del flusso funzionano dentro una sequenza avviata con
 `RUN`. `EXEC` li rifiuta perché non dispone del cursore e dello stack dei cicli.
+
+Il Dev Studio può compilare più catene scollegate come attività cooperative.
+Ogni attività conserva il proprio cursore, timer e stato di attesa: `DELAY` e
+`WAIT_BUTTON` sospendono solo la catena in cui si trovano, mentre il bridge
+continua a servire le altre. Una catena collegata resta un'unica attività; i
+rami vero e falso di `IF_VAR` o `IF_BUTTON` restano alternativi e non partono
+in parallelo. I marker `TASK BEGIN ONCE|LOOP` e `TASK END` sono generati dal
+Dev Studio e non sono blocchi della palette. I programmi salvati senza marker
+mantengono la precedente esecuzione lineare.
+Un'attività può saltare a un flusso manuale condiviso fuori dalle sezioni
+`TASK`. Quando il flusso torna all'etichetta del ciclo continuo generata dal
+compilatore, l'attività chiamante `ONCE` termina oppure quella `LOOP` riparte;
+il ciclo di destinazione è già in esecuzione autonomamente. Non è valido
+saltare nel corpo di un'altra attività.
 
 ### Label e salti
 
