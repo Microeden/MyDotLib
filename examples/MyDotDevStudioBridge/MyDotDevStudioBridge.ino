@@ -125,6 +125,29 @@
 // loop rate.
 Stream& bridgePhysicalSerial() { return Serial; }
 void beginBridgePhysicalSerial(unsigned long baud) { Serial.begin(baud); }
+// Use only space that the USB backend can accept now. The Mbed USBSerial
+// write() is fully blocking, so Nano RP2040 Connect uses its send_nb() API.
+// The SAMD core's availableForWrite() is only an endpoint size hint; a single
+// short write can still take up to its own 70 ms timeout when the host stalls.
+size_t bridgePhysicalWriteAvailable(const uint8_t* data, size_t size) {
+  if (size == 0) return 0;
+#if defined(ARDUINO_NANO_RP2040_CONNECT) && defined(ARDUINO_ARCH_MBED)
+  uint32_t sent = 0;
+  const size_t chunk = size < 64 ? size : 64;
+  Serial.send_nb(const_cast<uint8_t*>(data), (uint32_t)chunk, &sent, true);
+  return sent <= chunk ? (size_t)sent : 0;
+#else
+#if defined(ARDUINO_ARCH_SAMD)
+  if (!Serial.dtr()) return 0;
+#endif
+  const int available = Serial.availableForWrite();
+  if (available <= 0) return 0;
+  size_t chunk = size < (size_t)available ? size : (size_t)available;
+  if (chunk > 64) chunk = 64;
+  const size_t sent = Serial.write(data, chunk);
+  return sent <= chunk ? sent : 0;
+#endif
+}
 void limitBridgeUsbWriteWait() {
 #if defined(ARDUINO_NANO_ESP32) && defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
   // Keep this above zero: some ESP32 USB CDC core versions mishandle a zero
@@ -135,25 +158,117 @@ void limitBridgeUsbWriteWait() {
 
 class BridgeSerialOutput : public Stream {
  public:
+  static const uint16_t RUNTIME_TX_BUDGET_MS = 2;
+  static const uint16_t REPLY_TX_BUDGET_MS = 3000;
+  static const uint16_t RUNTIME_TX_BACKOFF_MS = 1000;
   void begin(unsigned long baud) { beginBridgePhysicalSerial(baud); }
   int available() override { return bridgePhysicalSerial().available(); }
   int read() override { return bridgePhysicalSerial().read(); }
   int peek() override { return bridgePhysicalSerial().peek(); }
-  void flush() override {
-    if (outputEnabled) bridgePhysicalSerial().flush();
-  }
+  // A physical USB flush may wait for a host that is no longer reading.
+  void flush() override {}
 
   size_t write(uint8_t value) override { return write(&value, 1); }
   size_t write(const uint8_t* data, size_t size) override {
-    return outputEnabled ? bridgePhysicalSerial().write(data, size) : size;
+    if (!outputEnabled || size == 0) return size;
+    if (replyFailed) {
+      droppedBytes += size;
+      return size;
+    }
+    const uint32_t now = millis();
+    if (!protocolReply && (int32_t)(now - nextRuntimeTxAttempt) < 0) {
+      droppedBytes += size;
+      return size;
+    }
+    const uint32_t budget = protocolReply ? REPLY_TX_BUDGET_MS : RUNTIME_TX_BUDGET_MS;
+    uint32_t& txTimeUsed = protocolReply ? replyTxTimeUsed : runtimeTxTimeUsed;
+    // If a previous line was cut short, separate it from the next message.
+    // Otherwise a later STATUS/CAPS reply could be appended to a partial log.
+    while (pendingLineBreak && txTimeUsed < budget) {
+      const uint8_t newline = '\n';
+      const uint32_t writeStarted = millis();
+      const size_t sent = bridgePhysicalWriteAvailable(&newline, 1);
+      txTimeUsed += millis() - writeStarted;
+      if (sent == 1) {
+        pendingLineBreak = false;
+        physicalLineOpen = false;
+      } else if (!protocolReply) {
+        nextRuntimeTxAttempt = millis() + RUNTIME_TX_BACKOFF_MS;
+        break;
+      } else {
+        const uint32_t waitStarted = millis();
+        delay(1);
+        txTimeUsed += millis() - waitStarted;
+      }
+    }
+    if (pendingLineBreak) {
+      droppedBytes += size;
+      if (protocolReply) replyFailed = true;
+      return size;
+    }
+    size_t written = 0;
+    while (written < size) {
+      if (txTimeUsed >= budget) break;
+      const uint32_t writeStarted = millis();
+      const size_t sent = bridgePhysicalWriteAvailable(data + written, size - written);
+      const uint32_t elapsed = millis() - writeStarted;
+      txTimeUsed += elapsed;
+      for (size_t index = 0; index < sent; ++index) {
+        if (data[written + index] == '\n') physicalLineOpen = false;
+        else if (data[written + index] != '\r') physicalLineOpen = true;
+      }
+      written += sent;
+      if (!protocolReply && (sent == 0 || elapsed > 10)) {
+        // On SAMD the core may consume its own bounded timeout before a
+        // failed write. Do not repeat that cost on every runtime iteration.
+        nextRuntimeTxAttempt = millis() + RUNTIME_TX_BACKOFF_MS;
+        break;
+      }
+      if (sent == 0) {
+        const uint32_t waitStarted = millis();
+        delay(1);
+        txTimeUsed += millis() - waitStarted;
+      }
+    }
+    if (written < size) {
+      droppedBytes += size - written;
+      if (physicalLineOpen) pendingLineBreak = true;
+      if (protocolReply) replyFailed = true;
+    }
+    // Print callers need not treat intentional log shedding as an I/O error.
+    return size;
   }
   using Print::write;
 
-  void setOutputEnabled(bool enabled) { outputEnabled = enabled; }
+  void setOutputEnabled(bool enabled) {
+    outputEnabled = enabled;
+    if (enabled && !protocolReply) runtimeTxTimeUsed = 0;
+  }
   bool isOutputEnabled() const { return outputEnabled; }
+  bool isProtocolReply() const { return protocolReply; }
+  void beginProtocolReply() {
+    protocolReply = true;
+    outputEnabled = true;
+    replyTxTimeUsed = 0;
+    replyFailed = false;
+  }
+  void endProtocolReply(bool restoreOutput) {
+    protocolReply = false;
+    replyFailed = false;
+    setOutputEnabled(restoreOutput);
+  }
+  uint32_t getDroppedBytes() const { return droppedBytes; }
 
  private:
   bool outputEnabled = false;
+  bool protocolReply = false;
+  bool replyFailed = false;
+  bool physicalLineOpen = false;
+  bool pendingLineBreak = false;
+  uint32_t replyTxTimeUsed = 0;
+  uint32_t runtimeTxTimeUsed = 0;
+  uint32_t nextRuntimeTxAttempt = 0;
+  uint32_t droppedBytes = 0;
 };
 
 BridgeSerialOutput bridgeSerial;
@@ -168,6 +283,10 @@ const uint8_t MAX_RUNTIME_TASKS = 16;
 // A browser can queue commands faster than they can be executed. Bound USB
 // receive work so the network and resident runtime still get CPU time.
 const uint8_t MAX_SERIAL_BYTES_PER_PASS = 96;
+// A fast resident SERIAL loop must not flood the native USB CDC task. Keep
+// protocol replies (STATUS, CAPS, EXEC) unrestricted; only autonomous output
+// is sampled, without slowing the runtime or the other tasks.
+const uint32_t MIN_RUNTIME_SERIAL_INTERVAL_MS = 100;
 // Byte di controllo fuori banda. Il Dev Studio lo invia senza attendere la
 // coda delle richieste normali, così STOP può essere rilevato anche mentre
 // una lettura/scrittura della microSD è ancora in corso.
@@ -204,6 +323,9 @@ bool i2cReady = false;
 uint32_t i2cFrequency = DEFAULT_I2C_FREQUENCY;
 bool runtimeRunning = false;
 bool runtimeLogsEnabled = false;
+uint32_t lastRuntimeSerialAt = 0;
+bool runtimeSerialHasEmitted = false;
+uint32_t runtimeSerialSkippedLines = 0;
 uint16_t runtimeIndex = 0;
 unsigned long runtimeWaitUntil = 0;
 struct RuntimeLoopFrame {
@@ -1194,9 +1316,10 @@ bool pollEmergencyStop() {
   if (!emergencyStopRequested) return false;
   emergencyStopRequested = false;
   const bool previousOutput = bridgeSerial.isOutputEnabled();
-  bridgeSerial.setOutputEnabled(true);  // ETX is an explicit control request.
+  const bool previousReply = bridgeSerial.isProtocolReply();
+  if (!previousReply) bridgeSerial.beginProtocolReply();
   stopRuntime();
-  bridgeSerial.setOutputEnabled(previousOutput);
+  if (!previousReply) bridgeSerial.endProtocolReply(previousOutput);
   return true;
 }
 
@@ -1412,18 +1535,21 @@ void serviceDeviceReboot() {
   if (!rebootRequested) return;
   rebootRequested = false;
   const bool previousOutput = bridgeSerial.isOutputEnabled();
-  if (rebootRequestedFromSerial) bridgeSerial.setOutputEnabled(true);
+  const bool previousReply = bridgeSerial.isProtocolReply();
+  if (rebootRequestedFromSerial && !previousReply) bridgeSerial.beginProtocolReply();
   rebootRequestedFromSerial = false;
   if (!dot.rebootSupported()) {
     Serial.println(F("ERR REBOOT unsupported-on-board"));
-    bridgeSerial.setOutputEnabled(previousOutput);
+    if (!previousReply) bridgeSerial.endProtocolReply(previousOutput);
     return;
   }
   Serial.println(F("OK REBOOT"));
+  // The bridge flush is deliberately nonblocking: the reboot must not wait
+  // indefinitely for a disconnected or stalled browser.
   Serial.flush();
   delay(50);
   dot.reboot();
-  bridgeSerial.setOutputEnabled(previousOutput);
+  if (!previousReply) bridgeSerial.endProtocolReply(previousOutput);
 }
 
 bool parseButtonCondition(String& text, uint8_t& button, bool& click) {
@@ -3695,6 +3821,16 @@ bool executeRuntimeCommand(String command, bool allowDelay) {
   }
 
   if (operation == "SERIAL") {
+    if (allowDelay) {
+      const uint32_t now = millis();
+      if (runtimeSerialHasEmitted &&
+          (uint32_t)(now - lastRuntimeSerialAt) < MIN_RUNTIME_SERIAL_INTERVAL_MS) {
+        ++runtimeSerialSkippedLines;
+        return true;
+      }
+      lastRuntimeSerialAt = now;
+      runtimeSerialHasEmitted = true;
+    }
     Serial.println(rest);
     return true;
   }
@@ -4347,6 +4483,10 @@ void printStatus() {
   Serial.print(variableCount);
   Serial.print(F(" runtimeLogs="));
   Serial.print(runtimeLogsEnabled ? F("on") : F("off"));
+  Serial.print(F(" serialDroppedBytes="));
+  Serial.print(bridgeSerial.getDroppedBytes());
+  Serial.print(F(" serialSkippedLines="));
+  Serial.print(runtimeSerialSkippedLines);
   Serial.print(F(" running="));
   Serial.print(runtimeRunning ? F("true") : F("false"));
   Serial.print(F(" tasks="));
@@ -4588,14 +4728,14 @@ void serviceSerial() {
       serialLine[serialLineLength] = '\0';
       // Every completed input line is a user/editor request, so its reply is
       // visible even when autonomous diagnostics are disabled.
-      bridgeSerial.setOutputEnabled(true);
+      bridgeSerial.beginProtocolReply();
       if (serialLineOverflow) {
         Serial.println(F("ERR SERIAL line-too-long"));
       } else {
         processSerialCommand(String(serialLine));
       }
       if (rebootRequested) rebootRequestedFromSerial = true;
-      bridgeSerial.setOutputEnabled(runtimeLogsEnabled);
+      bridgeSerial.endProtocolReply(runtimeLogsEnabled);
       serialLineLength = 0;
       serialLine[0] = '\0';
       serialLineOverflow = false;

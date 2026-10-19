@@ -70,16 +70,26 @@ Wi-Fi/MQTT messages are not sent to USB. `LOGS ON` enables them temporarily
 for debugging; `LOGS OFF` turns them off again, and `LOGS STATUS` reports the
 current setting. This setting is not saved to `/MyDot.run`. Replies to
 top-level requests (including `EXEC` and emergency `STOP`) and explicit
-`SERIAL <text>` runtime instructions are always printed. `STATUS` also
-includes `runtimeLogs=on|off`. A stopped runtime can be diagnosed with
+`SERIAL <text>` runtime instructions are sent when the USB reader can keep up.
+For a resident program, `SERIAL` sends at most one line every 100 ms across
+all tasks. Faster instructions continue running but their serial lines are
+skipped; `EXEC SERIAL` and protocol replies are not rate-limited. This keeps
+high-frequency programs from flooding the native USB interface.
+`STATUS` also includes `runtimeLogs=on|off`. A stopped runtime can be diagnosed with
 `STATUS` after reconnecting, or by enabling logs before reproducing the issue.
 Descriptions below of normal serial output from runtime commands apply to
 `EXEC` or to the resident sequence with `LOGS ON`.
 
-On Nano ESP32, the bridge bounds USB serial transmission waits so a browser
-that stops reading diagnostics cannot indefinitely hold up the resident
-runtime. This does not replace the watchdog or guarantee that a different
-blocking operation cannot stall the board.
+On Nano ESP32, Nano RP2040 Connect and Nano 33 IoT, the Bridge applies a
+bounded time budget to serial output. If the browser stops consuming USB data, runtime output
+is dropped instead of queuing without limit or holding up the resident
+program. Protocol replies have a separate, longer budget; a reply may be
+incomplete if the connection is stalled. `STATUS serialDroppedBytes` counts
+discarded output bytes since boot, while `serialSkippedLines` counts resident
+`SERIAL` lines skipped by the 100 ms limit. This reduces USB output pressure;
+it cannot bound a call stuck inside a board's USB core or guarantee recovery
+from a USB-core failure, and does
+not replace the watchdog or protect other blocking I/O.
 
 The portable watchdog commands are available as runtime instructions and can
 also be sent through `EXEC`:
@@ -98,7 +108,7 @@ flow can still be detected. `CAPS FEATURE watchdog=cooperative` identifies
 this backend.
 
 `STATUS` keeps the original key/value fields and adds `board` (the readable
-board name detected from the Arduino core), `wifi`, `wifiRssi`,
+board name detected from the Arduino core), `serialDroppedBytes`, `wifi`, `wifiRssi`,
 `cloud`, `sdCardBytes`, `sdTotalBytes`, `sdUsedBytes`, `sdFreeBytes`,
 `ramFreeBytes` and `ramTotalBytes`. `sdCardBytes` is the physical card
 capacity (`cardSize()`); `sdTotalBytes` is the usable filesystem capacity.

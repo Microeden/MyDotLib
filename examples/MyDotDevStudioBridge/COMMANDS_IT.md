@@ -79,16 +79,28 @@ gli avvisi/errori del runtime né i messaggi Wi-Fi/MQTT della libreria MyDot.
 `LOGS STATUS` mostra l'impostazione corrente. L'impostazione non viene salvata
 in `/MyDot.run`. Restano sempre visibili le risposte ai comandi richiesti
 (inclusi `EXEC` e lo `STOP` di emergenza) e le istruzioni runtime esplicite
-`SERIAL <testo>`. Anche `STATUS` include `runtimeLogs=on|off`. Dopo una
+`SERIAL <testo>`, finché il lettore USB riesce a riceverle.
+Nella sequenza residente, `SERIAL` invia al massimo una riga ogni 100 ms
+considerando tutti i task. Le istruzioni più frequenti continuano a girare,
+ma le loro righe seriali vengono scartate; `EXEC SERIAL` e le risposte del
+protocollo non sono limitati. Questo evita di saturare l'USB con programmi
+ad alta frequenza. `STATUS` include `runtimeLogs=on|off`. Dopo una
 disconnessione si può interrogare `STATUS` oppure attivare i log prima di
 riprodurre il problema.
 Le descrizioni seguenti dell'output seriale ordinario dei comandi runtime si
 riferiscono a `EXEC` oppure alla sequenza residente con `LOGS ON`.
 
-Sulla Nano ESP32, il bridge limita l'attesa della trasmissione seriale USB:
-se il browser smette di leggere i log non dovrebbe bloccare indefinitamente
-il runtime residente. Questo non sostituisce il watchdog e non esclude blocchi
-dovuti ad altre operazioni.
+Su Nano ESP32, Nano RP2040 Connect e Nano 33 IoT, il Bridge applica un limite
+di tempo all'output seriale. Se il browser non consuma i dati USB, l'output del runtime
+viene scartato anziché accumularsi senza limite o fermare il programma.
+Le risposte del protocollo hanno un limite separato e più lungo, ma possono
+risultare incomplete se la connessione è bloccata. Il campo
+`STATUS serialDroppedBytes` conta i byte scartati dall'avvio;
+`serialSkippedLines` conta le righe `SERIAL` scartate dal limite di 100 ms.
+La riduzione del traffico USB non limita una chiamata bloccata dentro il core
+della scheda, non garantisce il recupero da un blocco interno, non sostituisce
+il watchdog e non copre altre operazioni
+di I/O bloccanti.
 
 I comandi watchdog portabili sono disponibili come istruzioni runtime e anche
 tramite `EXEC`:
@@ -107,7 +119,7 @@ bloccato può essere rilevato. `CAPS FEATURE watchdog=cooperative` identifica
 questo backend.
 
 `STATUS` mantiene i campi chiave/valore già presenti e aggiunge `board` (nome
-della scheda rilevato dal core Arduino), `wifi`,
+della scheda rilevato dal core Arduino), `serialDroppedBytes`, `wifi`,
 `wifiRssi`, `cloud`, `sdCardBytes`, `sdTotalBytes`, `sdUsedBytes`,
 `sdFreeBytes`, `ramFreeBytes` e `ramTotalBytes`. `sdCardBytes` è la capacità
 fisica della scheda (`cardSize()`); `sdTotalBytes` è la capacità utilizzabile
