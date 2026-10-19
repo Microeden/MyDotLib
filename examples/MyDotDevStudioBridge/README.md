@@ -74,6 +74,19 @@ ADD BRIGHTNESS 255
 ADD LABEL END
 ```
 
+For decimal calculations, `MATH` stores results in those same variables.
+It supports constants such as `PI`, square roots, trigonometry in radians or
+degrees, `ATAN2` for sensor angles, and vector lengths. For example:
+
+```text
+ADD MATH HYPOT $AY $AZ YZ_LENGTH
+ADD MATH ATAN2_DEG $AX $YZ_LENGTH PITCH_DEG
+ADD SERIAL pitch=$PITCH_DEG
+```
+
+Here `$AX`, `$AY` and `$AZ` must already contain sensor readings. `CAPS MATH`
+lists the supported operations and argument counts for editor integration.
+
 `RELAY STATUS <variable>` reads the current relay state without changing it and
 stores `ON` or `OFF` in the given runtime variable. The value can be consumed
 by the next block or by a conditional block.

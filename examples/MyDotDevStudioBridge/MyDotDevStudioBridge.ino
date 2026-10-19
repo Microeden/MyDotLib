@@ -54,6 +54,7 @@
  *   DIGITAL_READ <pin> <variable> | DIGITAL_WRITE <pin> <value>
  *   ANALOG_READ <pin> <variable> | ANALOG_WRITE <pin> <0..255>
  *   SET <variable> <value> | GET <variable> | VARS | UNSET <variable> | CLEAR_VARS
+ *   MATH <operation> <numbers...> <variable>
  *   IF_VAR <variable> <operator> <value> GOTO <name>
  *   LABEL <name> | GOTO <name>
  *   IF_BUTTON A|B PRESSED|CLICKED GOTO <name>
@@ -101,6 +102,7 @@
 #include <math.h>
 #include "microeden_secrets.h"
 #include "runtime_integer_expression.h"
+#include "runtime_math.h"
 
 #if defined(ARDUINO_ARCH_ESP32)
 #include <esp_attr.h>
@@ -591,6 +593,7 @@ void printHelp() {
   Serial.println(F("  DIGITAL_READ/WRITE | ANALOG_READ/WRITE"));
   Serial.println(F("  SET <name> <value> | GET <name> | VARS | UNSET <name> | CLEAR_VARS"));
   Serial.println(F("  BASE_CONVERT <value> <fromBase> <toBase> <variable> (bases 2..36)"));
+  Serial.println(F("  MATH <operation> <numbers...> <variable> (see CAPS MATH or COMMANDS.md)"));
   Serial.println(F("  IF_VAR <name> <op> <value> GOTO <label>"));
   Serial.println(F("  LABEL <name> | GOTO <name> | IF_BUTTON A|B PRESSED|CLICKED GOTO <name>"));
   Serial.println(F("  WAIT_BUTTON A|B PRESSED|CLICKED [timeoutMs] [GOTO label]"));
@@ -633,7 +636,7 @@ void printCapabilities() {
 #if MYDOT_HAS_SD_CAPACITY
   Serial.print(F(" SD"));
 #endif
-  Serial.println(F(" BUTTON COLOR WIDGET DIGITAL_READ DIGITAL_WRITE ANALOG_READ ANALOG_WRITE SET BASE_CONVERT GET VARS UNSET CLEAR_VARS IF_VAR LABEL GOTO IF_BUTTON WAIT_BUTTON REPEAT ENDREPEAT BREAK CONTINUE WATCHDOG REBOOT NOOP"));
+  Serial.println(F(" BUTTON COLOR WIDGET DIGITAL_READ DIGITAL_WRITE ANALOG_READ ANALOG_WRITE SET BASE_CONVERT MATH GET VARS UNSET CLEAR_VARS IF_VAR LABEL GOTO IF_BUTTON WAIT_BUTTON REPEAT ENDREPEAT BREAK CONTINUE WATCHDOG REBOOT NOOP"));
   // Non esiste più un tetto fisso al numero di righe: il limite effettivo è
   // la dimensione del payload e la lunghezza massima della singola riga.
   Serial.println(F("CAPS LIMITS commandLength=96 scriptBytes=4096"));
@@ -665,6 +668,16 @@ void printCapabilities() {
   Serial.println(F("CAPS COMMAND DELAY args=milliseconds type=uint range=0..300000"));
   Serial.println(F("CAPS COMMAND SET args=name,value type=variable"));
   Serial.println(F("CAPS COMMAND BASE_CONVERT args=value,fromBase,toBase,variable type=variable result=variable"));
+  Serial.println(F("CAPS COMMAND MATH args=operation,values,variable type=math result=variable"));
+  Serial.println(F("CAPS MATH CONST args=variable ops=PI|TAU|E"));
+  Serial.println(F("CAPS MATH UNARY_BASIC args=value,variable ops=ABS|NEG|SIGN|SQRT|CBRT|EXP|LN|LOG10|LOG2|FLOOR|CEIL|ROUND|TRUNC"));
+  Serial.println(F("CAPS MATH TRIG_RAD args=value,variable ops=SIN|COS|TAN|ASIN|ACOS|ATAN"));
+  Serial.println(F("CAPS MATH TRIG_DEG args=value,variable ops=SIN_DEG|COS_DEG|TAN_DEG|ASIN_DEG|ACOS_DEG|ATAN_DEG"));
+  Serial.println(F("CAPS MATH CONVERT args=value,variable ops=TO_DEG|TO_RAD"));
+  Serial.println(F("CAPS MATH HYPERBOLIC args=value,variable ops=SINH|COSH|TANH|ASINH|ACOSH|ATANH"));
+  Serial.println(F("CAPS MATH BINARY args=left,right,variable ops=ADD|SUB|MUL|DIV|MOD|POW|MIN|MAX|AVG|HYPOT|ATAN2|ATAN2_DEG|ROUND_TO"));
+  Serial.println(F("CAPS MATH TERNARY args=first,second,third,variable ops=CLAMP|LERP|NORM3"));
+  Serial.println(F("CAPS MATH MAP args=value,inMin,inMax,outMin,outMax,variable"));
   Serial.println(F("CAPS COMMAND GET args=name type=variable"));
   Serial.println(F("CAPS COMMAND VARS args=none type=variable"));
   Serial.println(F("CAPS COMMAND UNSET args=name type=variable"));
@@ -2885,10 +2898,109 @@ String formatBaseInteger(uint64_t magnitude, uint8_t base, bool negative) {
   return result;
 }
 
+bool parseMathOperand(String& text, double& value) {
+  String token = expandRuntimeVariables(takeToken(text));
+  if (token.equalsIgnoreCase("PI")) value = MYDOT_MATH_PI;
+  else if (token.equalsIgnoreCase("TAU")) value = 2.0 * MYDOT_MATH_PI;
+  else if (token.equalsIgnoreCase("E")) value = MYDOT_MATH_E;
+  else if (!parseDoubleValue(token, value)) return false;
+  return isfinite(value);
+}
+
+String formatMathResult(double value) {
+  if (value == 0.0) return String("0");
+
+  // Arduino String's fixed-point constructor can print "ovf" for large
+  // values and round tiny values to zero. Normalize those cases and append
+  // an exponent so the stored result remains a valid numeric token.
+  int exponent = 0;
+  double scaled = value;
+  if (fabs(scaled) >= 1000000.0) {
+    while (fabs(scaled) >= 10.0) {
+      scaled /= 10.0;
+      ++exponent;
+    }
+  } else if (fabs(scaled) < 0.000001) {
+    while (fabs(scaled) < 1.0) {
+      scaled *= 10.0;
+      --exponent;
+    }
+  }
+
+  String output(scaled, 8);
+  if (output.indexOf('.') >= 0) {
+    while (output.length() > 0 && output[output.length() - 1] == '0') {
+      output.remove(output.length() - 1);
+    }
+    if (output.length() > 0 && output[output.length() - 1] == '.') {
+      output.remove(output.length() - 1);
+    }
+  }
+  if (output == "-0") output = "0";
+  if (exponent != 0) {
+    output += 'e';
+    output += String(exponent);
+  }
+  return output;
+}
+
+bool executeMathCommand(String rest) {
+  String operation = takeToken(rest);
+  operation.toUpperCase();
+  const int8_t arity = myDotMathArity(operation.c_str());
+  if (arity < 0) {
+    Serial.println(F("ERR MATH unknown-operation"));
+    return false;
+  }
+
+  double values[5] = {};
+  for (int8_t index = 0; index < arity; ++index) {
+    if (!parseMathOperand(rest, values[index])) {
+      Serial.println(F("ERR MATH invalid-number"));
+      return false;
+    }
+  }
+  // Do not expand the destination name: an existing variable may already
+  // have a value, but this command must overwrite that named variable.
+  String destination = takeToken(rest);
+  if (destination.length() == 0 || rest.length() > 0) {
+    Serial.println(F("ERR MATH expected-arguments-and-variable"));
+    return false;
+  }
+
+  double result = 0.0;
+  const MyDotMathStatus status = myDotMathEvaluate(operation.c_str(), values, result);
+  if (status == MYDOT_MATH_DOMAIN_ERROR) {
+    Serial.println(F("ERR MATH domain"));
+    return false;
+  }
+  if (status != MYDOT_MATH_OK) {
+    Serial.println(F("ERR MATH nonfinite-result"));
+    return false;
+  }
+
+  const String formatted = formatMathResult(result);
+  double checked = 0.0;
+  if (!parseDoubleValue(formatted, checked) || !isfinite(checked)) {
+    Serial.println(F("ERR MATH result-format"));
+    return false;
+  }
+  if (!setRuntimeVariable(destination, formatted)) {
+    Serial.println(F("ERR MATH invalid-variable"));
+    return false;
+  }
+  return true;
+}
+
 bool executeRuntimeCommand(String command, bool allowDelay) {
   command.trim();
   if (command.length() == 0 || command.startsWith("#")) {
     return true;
+  }
+  String rawRest = command;
+  String rawOperation = takeToken(rawRest);
+  if (rawOperation.equalsIgnoreCase("MATH")) {
+    return executeMathCommand(rawRest);
   }
   command = expandRuntimeVariables(command);
 

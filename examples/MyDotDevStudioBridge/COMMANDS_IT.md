@@ -229,6 +229,61 @@ END_VARS
 I valori correnti sono volatili. Per ricreare un valore iniziale dopo
 `LOAD`/`RUN`, inserire un comando `SET` nella sequenza salvata.
 
+## Matematica
+
+`MATH <operazione> <operandi...> <variabile>` esegue calcoli decimali e salva
+il risultato in una variabile runtime. Gli operandi possono essere numeri,
+`PI`, `TAU`, `E` oppure riferimenti a variabili `$NOME`. Il separatore decimale
+è il punto. Il nome della variabile di destinazione non viene sostituito,
+quindi si può aggiornare la stessa variabile. I risultati usano fino a otto
+cifre decimali; per valori molto grandi o piccoli viene usata la notazione
+scientifica. È disponibile anche `EXEC MATH ...`.
+
+| Operazione | Operandi prima della destinazione | Significato |
+| --- | --- | --- |
+| `PI`, `TAU`, `E` | nessuno | Salva la costante (τ = 2π). |
+| `ADD`, `SUB`, `MUL`, `DIV`, `MOD`, `POW` | `a b` | Aritmetica; `MOD` è il resto fra numeri decimali. |
+| `MIN`, `MAX`, `AVG`, `HYPOT` | `a b` | Minimo, massimo, media e lunghezza euclidea. |
+| `ABS`, `NEG`, `SIGN` | `a` | Valore assoluto, opposto, segno (`-1`, `0`, `1`). |
+| `SQRT`, `CBRT`, `EXP` | `a` | Radice quadrata, radice cubica, e elevato ad `a`. |
+| `LN`, `LOG10`, `LOG2` | `a` | Logaritmo naturale, in base 10 o in base 2. |
+| `FLOOR`, `CEIL`, `ROUND`, `TRUNC` | `a` | Arrotondamenti; `ROUND` allontana i mezzi da zero. |
+| `ROUND_TO` | `a decimali` | Arrotonda a 0–8 cifre decimali. |
+| `SIN`, `COS`, `TAN` | `angolo` | Trigonometria con ingresso in radianti. |
+| `ASIN`, `ACOS`, `ATAN` | `a` | Trigonometria inversa con risultato in radianti. |
+| `ATAN2` | `y x` | Angolo con riconoscimento del quadrante, in radianti. |
+| `SIN_DEG`, `COS_DEG`, `TAN_DEG` | `angolo` | Trigonometria con ingresso in gradi. |
+| `ASIN_DEG`, `ACOS_DEG`, `ATAN_DEG` | `a` | Trigonometria inversa con risultato in gradi. |
+| `ATAN2_DEG` | `y x` | Angolo con riconoscimento del quadrante, in gradi (−180..180). |
+| `TO_DEG`, `TO_RAD` | `angolo` | Conversione radianti→gradi o gradi→radianti. |
+| `SINH`, `COSH`, `TANH` | `a` | Funzioni iperboliche. |
+| `ASINH`, `ACOSH`, `ATANH` | `a` | Funzioni iperboliche inverse. |
+| `CLAMP` | `valore minimo massimo` | Limita il valore all'intervallo incluso. |
+| `LERP` | `inizio fine frazione` | Interpolazione lineare (anche estrapolazione). |
+| `NORM3` | `x y z` | Lunghezza di un vettore a tre componenti. |
+| `MAP` | `valore inMin inMax outMin outMax` | Rimappatura lineare; non limita il risultato. |
+
+Per esempio, per calcolare un angolo e inviarlo a un widget cloud:
+
+```text
+MATH PI CIRCLE_PI
+MATH SQRT 9 ROOT
+MATH HYPOT $AY $AZ YZ_LENGTH
+MATH ATAN2_DEG $AX $YZ_LENGTH PITCH_DEG
+SERIAL pitch=$PITCH_DEG
+WIDGET WRITE LEVEL pitch $PITCH_DEG
+```
+
+`$AX`, `$AY` e `$AZ` rappresentano campioni di un accelerometro già salvati
+in variabili; la formula corretta per gli assi dipende dall'orientamento del
+sensore. Divisione o `MOD` per zero, radice quadrata di un numero negativo,
+logaritmo di un numero non positivo, argomenti non validi per le funzioni
+trigonometriche inverse e risultati non finiti producono `ERR MATH ...`.
+Come per gli altri comandi runtime non validi, la sequenza `RUN` si ferma.
+Per dati normalizzati rumorosi, usare `CLAMP` prima di `ASIN` o `ACOS`.
+Le operazioni disponibili e i loro argomenti sono esposti anche nelle righe
+`CAPS MATH`, utilizzabili dal Dev Studio.
+
 ## Ingressi e uscite digitali/analogici
 
 I pin possono essere indicati con il numero Arduino oppure con etichette come

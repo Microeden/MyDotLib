@@ -225,6 +225,59 @@ END_VARS
 The live values are volatile. To recreate an initial value after `LOAD`/`RUN`,
 include a `SET` command in the saved sequence.
 
+## Mathematics
+
+`MATH <operation> <operands...> <variable>` calculates with decimal numbers
+and stores the result in a runtime variable. Operands can be numeric literals,
+`PI`, `TAU`, `E`, or existing `$VARIABLE` references. Use a dot as the decimal
+separator. The destination name is not substituted, so it can be updated in
+place. Results are stored with up to eight decimal places; very large or small
+results use scientific notation. `EXEC MATH ...` is also supported.
+
+| Operation | Operands before destination | Meaning |
+| --- | --- | --- |
+| `PI`, `TAU`, `E` | none | Store the constant (τ = 2π). |
+| `ADD`, `SUB`, `MUL`, `DIV`, `MOD`, `POW` | `a b` | Arithmetic; `MOD` is floating-point remainder. |
+| `MIN`, `MAX`, `AVG`, `HYPOT` | `a b` | Minimum, maximum, average, Euclidean length. |
+| `ABS`, `NEG`, `SIGN` | `a` | Absolute value, negation, sign (`-1`, `0`, `1`). |
+| `SQRT`, `CBRT`, `EXP` | `a` | Square root, cube root, e to the power `a`. |
+| `LN`, `LOG10`, `LOG2` | `a` | Natural, base-10 and base-2 logarithms. |
+| `FLOOR`, `CEIL`, `ROUND`, `TRUNC` | `a` | Integer rounding; `ROUND` rounds halves away from zero. |
+| `ROUND_TO` | `a decimals` | Round to 0–8 decimal places. |
+| `SIN`, `COS`, `TAN` | `angle` | Trigonometry; input in radians. |
+| `ASIN`, `ACOS`, `ATAN` | `a` | Inverse trigonometry; result in radians. |
+| `ATAN2` | `y x` | Quadrant-aware angle in radians. |
+| `SIN_DEG`, `COS_DEG`, `TAN_DEG` | `angle` | Trigonometry; input in degrees. |
+| `ASIN_DEG`, `ACOS_DEG`, `ATAN_DEG` | `a` | Inverse trigonometry; result in degrees. |
+| `ATAN2_DEG` | `y x` | Quadrant-aware angle in degrees (−180 to 180). |
+| `TO_DEG`, `TO_RAD` | `angle` | Convert radians to degrees or degrees to radians. |
+| `SINH`, `COSH`, `TANH` | `a` | Hyperbolic functions. |
+| `ASINH`, `ACOSH`, `ATANH` | `a` | Inverse hyperbolic functions. |
+| `CLAMP` | `value min max` | Limit a value to the inclusive range. |
+| `LERP` | `start end fraction` | Linear interpolation (or extrapolation). |
+| `NORM3` | `x y z` | Length of a three-component vector. |
+| `MAP` | `value inMin inMax outMin outMax` | Linear range mapping; does not clamp. |
+
+For example, calculate a sensor angle and send it to a cloud widget:
+
+```text
+MATH PI CIRCLE_PI
+MATH SQRT 9 ROOT
+MATH HYPOT $AY $AZ YZ_LENGTH
+MATH ATAN2_DEG $AX $YZ_LENGTH PITCH_DEG
+SERIAL pitch=$PITCH_DEG
+WIDGET WRITE LEVEL pitch $PITCH_DEG
+```
+
+`$AX`, `$AY`, and `$AZ` represent accelerometer samples already stored in
+variables; the appropriate axis formula depends on the sensor's orientation.
+Division or `MOD` by zero, square root of a negative number, logarithm of a
+non-positive number, invalid inverse-trigonometric inputs, and non-finite
+results return `ERR MATH ...`. As with other invalid runtime commands, this
+stops the current `RUN` sequence. For noisy normalized sensor values, use
+`CLAMP` before `ASIN` or `ACOS`. The supported operations and their argument
+counts are also exposed in `CAPS MATH` lines for Dev Studio integration.
+
 ## Digital and analog I/O
 
 Pin arguments accept numeric Arduino pin numbers and board labels such as
