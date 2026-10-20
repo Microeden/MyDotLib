@@ -393,7 +393,12 @@ bool rebootRequested = false;
 bool rebootRequestedFromSerial = false;
 bool runtimeTransientFailure = false;
 char decryptedScript[MAX_RUNTIME_BYTES + 1];
-
+// PATCH usa un buffer separato: una modifica interrotta non altera mai il
+// programma residente. Il commit copia la sequenza soltanto dopo CRC e limiti.
+char patchScript[MAX_RUNTIME_BYTES + 1];
+uint16_t patchScriptLength = 0;
+uint16_t patchCommandCount = 0;
+bool runtimePatchActive = false;
 #if defined(ARDUINO_ARCH_ESP32)
 bool bridgeTaskWatchdogReady = false;
 const uint32_t BRIDGE_TRACE_MAGIC = 0x4D445442UL;
@@ -681,19 +686,158 @@ size_t scriptLength() {
   return runtimeScriptLength;
 }
 
-uint32_t scriptCrc() {
+uint32_t runtimeBufferCrc(const char* script, uint16_t length) {
   uint32_t crc = 0xFFFFFFFFUL;
-  for (uint16_t index = 0; index < runtimeScriptLength; ++index) {
-    crc = crc32Update(crc, (uint8_t)decryptedScript[index]);
-  }
+  for (uint16_t index = 0; index < length; ++index) crc = crc32Update(crc, (uint8_t)script[index]);
   return ~crc;
+}
+
+uint32_t scriptCrc() {
+  return runtimeBufferCrc(decryptedScript, runtimeScriptLength);
+}
+
+bool countScriptCommands(const char* script, uint16_t length, uint16_t& count, bool validate = true) {
+  count = 0;
+  uint16_t start = 0;
+  for (uint16_t index = 0; index <= length; ++index) {
+    if (index < length && script[index] != '\n') continue;
+    uint16_t first = start;
+    uint16_t last = index;
+    while (first < last && (script[first] == ' ' || script[first] == '\t' || script[first] == '\r')) ++first;
+    while (last > first && (script[last - 1] == ' ' || script[last - 1] == '\t' || script[last - 1] == '\r')) --last;
+    if (last > first) {
+      if (validate && last - first > MAX_COMMAND_LENGTH) return false;
+      ++count;
+    }
+    start = index + 1;
+  }
+  return true;
+}
+
+bool runtimeCommandStartAt(const char* script, uint16_t length, uint16_t target, uint16_t& offset) {
+  uint16_t current = 0;
+  uint16_t start = 0;
+  for (uint16_t index = 0; index <= length; ++index) {
+    if (index < length && script[index] != '\n') continue;
+    bool hasContent = false;
+    for (uint16_t character = start; character < index; ++character) {
+      if (script[character] != ' ' && script[character] != '\t' && script[character] != '\r') {
+        hasContent = true;
+        break;
+      }
+    }
+    if (hasContent) {
+      if (current == target) { offset = start; return true; }
+      ++current;
+    }
+    start = index + 1;
+  }
+  if (target == current) { offset = length; return true; }
+  return false;
+}
+
+int8_t base64Value(char value) {
+  if (value >= 'A' && value <= 'Z') return value - 'A';
+  if (value >= 'a' && value <= 'z') return value - 'a' + 26;
+  if (value >= '0' && value <= '9') return value - '0' + 52;
+  if (value == '+') return 62;
+  if (value == '/') return 63;
+  return -1;
+}
+
+bool decodePatchCommand(String encoded, char* output, uint16_t capacity, uint16_t& outputLength) {
+  encoded.trim();
+  outputLength = 0;
+  if (encoded.length() == 0 || encoded.length() % 4 != 0 || capacity == 0) return false;
+  for (uint16_t index = 0; index < encoded.length(); index += 4) {
+    const bool lastGroup = index + 4 == encoded.length();
+    const char c0 = encoded[index];
+    const char c1 = encoded[index + 1];
+    const char c2 = encoded[index + 2];
+    const char c3 = encoded[index + 3];
+    const int8_t a = base64Value(c0);
+    const int8_t b = base64Value(c1);
+    const int8_t c = c2 == '=' ? 0 : base64Value(c2);
+    const int8_t d = c3 == '=' ? 0 : base64Value(c3);
+    if (a < 0 || b < 0 || c < 0 || d < 0 || (!lastGroup && (c2 == '=' || c3 == '=')) || (c2 == '=' && c3 != '=')) return false;
+    if (outputLength + 1 >= capacity) return false;
+    output[outputLength++] = (char)((a << 2) | (b >> 4));
+    if (c2 != '=') {
+      if (outputLength + 1 >= capacity) return false;
+      output[outputLength++] = (char)((b << 4) | (c >> 2));
+    }
+    if (c3 != '=') {
+      if (outputLength + 1 >= capacity) return false;
+      output[outputLength++] = (char)((c << 6) | d);
+    }
+  }
+  output[outputLength] = '\0';
+  if (outputLength == 0) return false;
+  for (uint16_t index = 0; index < outputLength; ++index) {
+    if (output[index] == '\0' || output[index] == '\n' || output[index] == '\r') return false;
+  }
+  return true;
+}
+
+bool parsePatchIndex(String token, uint16_t& value) {
+  token.trim();
+  if (token.length() == 0) return false;
+  uint32_t parsed = 0;
+  for (uint16_t index = 0; index < token.length(); ++index) {
+    if (token[index] < '0' || token[index] > '9') return false;
+    const uint32_t digit = (uint8_t)(token[index] - '0');
+    if (parsed > (65535UL - digit) / 10UL) return false;
+    parsed = parsed * 10UL + digit;
+  }
+  value = (uint16_t)parsed;
+  return true;
+}
+
+bool parsePatchCrc(String token, uint32_t& value) {
+  token.trim();
+  if (token.startsWith("0x") || token.startsWith("0X")) token.remove(0, 2);
+  if (token.length() == 0 || token.length() > 8) return false;
+  uint32_t parsed = 0;
+  for (uint16_t index = 0; index < token.length(); ++index) {
+    const char character = token[index];
+    uint8_t digit;
+    if (character >= '0' && character <= '9') digit = character - '0';
+    else if (character >= 'a' && character <= 'f') digit = character - 'a' + 10;
+    else if (character >= 'A' && character <= 'F') digit = character - 'A' + 10;
+    else return false;
+    parsed = (parsed << 4) | digit;
+  }
+  value = parsed;
+  return true;
+}
+
+bool applyRuntimePatch(uint16_t commandIndex, uint16_t deleteCount, const char* replacement, uint16_t replacementLength) {
+  if (!runtimePatchActive || commandIndex > patchCommandCount || deleteCount > patchCommandCount - commandIndex) return false;
+  if (replacementLength > MAX_COMMAND_LENGTH || (replacementLength > 0 && !replacement)) return false;
+  uint16_t startOffset = 0;
+  uint16_t endOffset = 0;
+  if (!runtimeCommandStartAt(patchScript, patchScriptLength, commandIndex, startOffset)
+      || !runtimeCommandStartAt(patchScript, patchScriptLength, commandIndex + deleteCount, endOffset)
+      || endOffset < startOffset) return false;
+  const uint16_t removedBytes = endOffset - startOffset;
+  const uint16_t insertedBytes = replacementLength > 0 ? replacementLength + 1 : 0;
+  const uint32_t newLength = (uint32_t)patchScriptLength - removedBytes + insertedBytes;
+  if (newLength > MAX_RUNTIME_BYTES) return false;
+  memmove(patchScript + startOffset + insertedBytes, patchScript + endOffset, patchScriptLength - endOffset + 1);
+  if (replacementLength > 0) {
+    memcpy(patchScript + startOffset, replacement, replacementLength);
+    patchScript[startOffset + replacementLength] = '\n';
+  }
+  patchScriptLength = (uint16_t)newLength;
+  if (!countScriptCommands(patchScript, patchScriptLength, patchCommandCount, true)) return false;
+  return true;
 }
 
 void printHelp() {
   Serial.println(F("MyDot Dev Studio Bridge protocol:"));
   Serial.println(F("  HELP | CAPS | STATUS | LOGS ON|OFF|STATUS"));
   Serial.println(F("  ADD <runtime command>"));
-  Serial.println(F("  LIST | CLEAR | SAVE | LOAD | RUN | STOP"));
+  Serial.println(F("  LIST | CLEAR | SAVE | LOAD | RUN | STOP | PATCH_BEGIN | PATCH | PATCH_COMMIT"));
   Serial.println(F("  REBOOT"));
   Serial.println(F("  EXEC <runtime command>"));
   Serial.println(F("Runtime commands:"));
@@ -723,7 +867,7 @@ void printHelp() {
 }
 
 void printCapabilities() {
-  Serial.println(F("CAPS VERSION 3"));
+  Serial.println(F("CAPS VERSION 4"));
   Serial.println(F("CAPS CONTROL emergencyStop=ETX"));
   Serial.print(F("CAPS BOARD name="));
   Serial.println(currentBoardName());
@@ -745,9 +889,10 @@ void printCapabilities() {
   Serial.println(dot.rebootSupported() ? F("cooperative") : F("unavailable"));
   Serial.println(F("CAPS FEATURE parallelTasks=supported"));
   Serial.println(F("CAPS FEATURE runtimeTasks=16"));
+  Serial.println(F("CAPS FEATURE runtimePatch=supported"));
   Serial.print(F("CAPS PINS "));
   Serial.println(F(MYDOT_PIN_MAP_NAME));
-  Serial.println(F("CAPS TOPLEVEL HELP CAPS STATUS LOGS ADD LIST CLEAR SAVE LOAD RUN STOP REBOOT EXEC"));
+  Serial.println(F("CAPS TOPLEVEL HELP CAPS STATUS LOGS ADD LIST CLEAR SAVE LOAD RUN STOP REBOOT EXEC PATCH_BEGIN PATCH PATCH_COMMIT"));
   Serial.print(F("CAPS RUNTIME DELAY RELAY BRIGHTNESS PIXELS PIXEL PIXELS_SHOW PIXELS_RANDOM CLEAR_PIXELS FAN DISPLAY SENSORS SENSOR_READ SENSORS_LOG I2C SERIAL"));
 #if MYDOT_HAS_WIFI
   Serial.print(F(" WIFI TIME"));
@@ -769,6 +914,9 @@ void printCapabilities() {
   Serial.println(F("CAPS COMMAND STATUS args=none type=status"));
   Serial.println(F("CAPS COMMAND LOGS args=state type=enum values=ON|OFF|STATUS default=OFF"));
   Serial.println(F("CAPS COMMAND ADD args=command type=runtime"));
+  Serial.println(F("CAPS COMMAND PATCH_BEGIN args=baseCrc type=metadata"));
+  Serial.println(F("CAPS COMMAND PATCH args=index,deleteCount,base64Command type=metadata"));
+  Serial.println(F("CAPS COMMAND PATCH_COMMIT args=targetCrc type=metadata"));
   Serial.println(F("CAPS COMMAND LIST args=none type=action"));
   Serial.println(F("CAPS COMMAND CLEAR args=none type=action"));
   Serial.println(F("CAPS COMMAND SAVE args=none type=storage"));
@@ -1964,16 +2112,40 @@ bool executeSdCommand(String rest) {
     }
     Serial.println(F("BEGIN_SD_READ"));
     bool aborted = false;
+    bool readFailed = false;
+    uint8_t buffer[128];
     while (file.available()) {
       if (pollEmergencyStop()) {
         aborted = true;
         break;
       }
-      Serial.write((uint8_t)file.read());
+      const size_t bytesRead = file.read(buffer, sizeof(buffer));
+      if (!bytesRead) {
+        readFailed = file.available();
+        break;
+      }
+      size_t offset = 0;
+      while (offset < bytesRead) {
+        if (pollEmergencyStop()) {
+          aborted = true;
+          break;
+        }
+        const size_t bytesWritten = Serial.write(buffer + offset, bytesRead - offset);
+        if (!bytesWritten) {
+          delay(1);
+          continue;
+        }
+        offset += bytesWritten;
+      }
+      if (aborted) break;
     }
     file.close();
     if (aborted) {
       Serial.println(F("ERR SD read-aborted"));
+      return false;
+    }
+    if (readFailed) {
+      Serial.println(F("ERR SD read-failed"));
       return false;
     }
     Serial.println();
@@ -4644,7 +4816,76 @@ void processSerialCommand(String command) {
     }
     Serial.println(runtimeLogsEnabled ? F("LOGS ON") : F("LOGS OFF"));
   } else if (operation == "ADD") {
-    addRuntimeCommand(rest);
+    if (runtimePatchActive) Serial.println(F("ERR ADD patch-active"));
+    else addRuntimeCommand(rest);
+  } else if (operation == "PATCH_BEGIN") {
+    uint32_t expectedCrc = 0;
+    String crcToken = takeToken(rest);
+    rest.trim();
+    if (runtimePatchActive) {
+      Serial.println(F("ERR PATCH_BEGIN already-active"));
+    } else if (rest.length() > 0 || !parsePatchCrc(crcToken, expectedCrc)) {
+      Serial.println(F("ERR PATCH_BEGIN invalid-crc"));
+    } else if (scriptCrc() != expectedCrc) {
+      Serial.println(F("ERR PATCH_BEGIN base-mismatch"));
+    } else {
+      runtimeRunning = false;
+      resetRuntimeControlState();
+      runtimePatchActive = true;
+      patchScriptLength = runtimeScriptLength;
+      patchCommandCount = runtimeCommandCount;
+      memcpy(patchScript, decryptedScript, runtimeScriptLength + 1);
+      Serial.println(F("OK PATCH_BEGIN"));
+      stopRuntimeOutputs();
+    }
+  } else if (operation == "PATCH") {
+    String indexToken = takeToken(rest);
+    String deleteToken = takeToken(rest);
+    String encoded = rest;
+    encoded.trim();
+    uint16_t commandIndex = 0;
+    uint16_t deleteCount = 0;
+    char replacement[MAX_COMMAND_LENGTH + 1] = {};
+    uint16_t replacementLength = 0;
+    const bool insertCommand = encoded != "-";
+    const bool decoded = !insertCommand || decodePatchCommand(encoded, replacement, sizeof(replacement), replacementLength);
+    if (!runtimePatchActive) {
+      Serial.println(F("ERR PATCH transaction-not-active"));
+    } else if (!parsePatchIndex(indexToken, commandIndex) || !parsePatchIndex(deleteToken, deleteCount)
+        || encoded.length() == 0 || (insertCommand && !decoded)
+        || !applyRuntimePatch(commandIndex, deleteCount, insertCommand ? replacement : nullptr, replacementLength)) {
+      Serial.println(F("ERR PATCH invalid-operation"));
+    } else {
+      Serial.print(F("OK PATCH "));
+      Serial.println(patchCommandCount);
+    }
+  } else if (operation == "PATCH_COMMIT") {
+    uint32_t expectedCrc = 0;
+    String crcToken = takeToken(rest);
+    rest.trim();
+    uint16_t verifiedCount = 0;
+    if (!runtimePatchActive) {
+      Serial.println(F("ERR PATCH_COMMIT transaction-not-active"));
+    } else if (rest.length() > 0 || !parsePatchCrc(crcToken, expectedCrc)) {
+      Serial.println(F("ERR PATCH_COMMIT invalid-crc"));
+    } else if (!countScriptCommands(patchScript, patchScriptLength, verifiedCount, true)
+        || runtimeBufferCrc(patchScript, patchScriptLength) != expectedCrc) {
+      Serial.println(F("ERR PATCH_COMMIT target-mismatch"));
+    } else {
+      memcpy(decryptedScript, patchScript, patchScriptLength + 1);
+      runtimeScriptLength = patchScriptLength;
+      runtimeCommandCount = verifiedCount;
+      runtimePatchActive = false;
+      patchScriptLength = 0;
+      patchCommandCount = 0;
+      patchScript[0] = '\0';
+      runtimeRunning = false;
+      resetRuntimeControlState();
+      Serial.print(F("OK PATCH_COMMIT count="));
+      Serial.print(runtimeCommandCount);
+      Serial.print(F(" crc="));
+      Serial.println(expectedCrc, HEX);
+    }
   } else if (operation == "LIST") {
     if (rest.length() > 0) Serial.println(F("ERR LIST unexpected-arguments"));
     else listRuntimeCommands();
@@ -4653,6 +4894,10 @@ void processSerialCommand(String command) {
       Serial.println(F("ERR CLEAR unexpected-arguments"));
       return;
     }
+    runtimePatchActive = false;
+    patchCommandCount = 0;
+    patchScriptLength = 0;
+    patchScript[0] = '\0';
     runtimeCommandCount = 0;
     runtimeScriptLength = 0;
     decryptedScript[0] = '\0';
@@ -4670,8 +4915,13 @@ void processSerialCommand(String command) {
     stopRuntimeOutputs();
   } else if (operation == "SAVE") {
     if (rest.length() > 0) Serial.println(F("ERR SAVE unexpected-arguments"));
+    else if (runtimePatchActive) Serial.println(F("ERR SAVE patch-active"));
     else saveRuntime();
   } else if (operation == "LOAD") {
+    runtimePatchActive = false;
+    patchScriptLength = 0;
+    patchCommandCount = 0;
+    patchScript[0] = '\0';
     if (rest.length() > 0) Serial.println(F("ERR LOAD unexpected-arguments"));
     else loadRuntime();
   } else if (operation == "RUN") {
@@ -4679,7 +4929,9 @@ void processSerialCommand(String command) {
       Serial.println(F("ERR RUN unexpected-arguments"));
       return;
     }
-    if (runtimeCommandCount == 0) {
+    if (runtimePatchActive) {
+      Serial.println(F("ERR RUN patch-active"));
+    } else if (runtimeCommandCount == 0) {
       Serial.println(F("ERR RUN empty-sequence"));
     } else if (initializeRuntimeTasks()) {
       Serial.println(F("OK RUN"));

@@ -14,7 +14,7 @@ The Serial Monitor should use **Newline** as the line ending.
 
 ## Structured capabilities
 
-`CAPS` returns protocol version `2`. In addition to the summary lines, it emits
+`CAPS` returns protocol version `4`. In addition to the summary lines, it emits
 one machine-readable line for every command:
 
 ```text
@@ -55,6 +55,9 @@ These commands manage the in-memory sequence or the bridge itself.
 | `STATUS` | Prints the board model, USB/runtime state plus Wi‑Fi, My Microeden, microSD capacity and ESP32 heap information when supported. |
 | `LOGS ON|OFF|STATUS` | Enables, disables or checks unsolicited Bridge and MyDot library diagnostics. Defaults to `OFF` after every boot. |
 | `ADD <runtime-command>` | Appends one command to the current sequence. |
+| `PATCH_BEGIN <baseCrc>` | Stops the runtime and opens an incremental transaction only when the resident script CRC matches. |
+| `PATCH <index> <deleteCount> <base64-command-or-dash>` | Edits the temporary copy by deleting indexed rows and optionally inserting one Base64-encoded command. |
+| `PATCH_COMMIT <targetCrc>` | Verifies limits and target CRC, then atomically replaces the resident sequence. |
 | `LIST` | Lists the sequence with zero-based command indexes. |
 | `CLEAR` | Immediately acknowledges deletion of the in-memory sequence, then stops execution and switches relay, fan and NeoPixels to a safe off state. It does not delete the SD file. |
 | `SAVE` | Encrypts the current sequence and writes `/MyDot.run` to SD. |

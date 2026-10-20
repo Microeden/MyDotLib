@@ -41,7 +41,7 @@ fornire corrente sufficiente agli stadi di potenza.
 
 ## Comando CAPS strutturato
 
-`CAPS` restituisce la versione di protocollo `2`. Oltre all’elenco sintetico,
+`CAPS` restituisce la versione di protocollo `4`. Oltre all’elenco sintetico,
 stampa una riga `CAPS COMMAND` per ogni comando:
 
 ```text
@@ -63,6 +63,9 @@ famiglia API, mentre `values` e `range` descrivono i valori ammessi.
 | `STATUS` | Mostra modello della scheda, collegamento/runtime, Wi‑Fi, My Microeden, capacità microSD e memoria heap ESP32 quando supportate. |
 | `LOGS ON|OFF|STATUS` | Attiva, disattiva o controlla i messaggi diagnostici spontanei del Bridge e della libreria MyDot. Dopo ogni avvio il valore predefinito è `OFF`. |
 | `ADD <runtime-command>` | Aggiunge un comando alla sequenza in memoria. |
+| `PATCH_BEGIN <baseCrc>` | Ferma il runtime e apre una transazione incrementale solo se il CRC del programma residente coincide. |
+| `PATCH <index> <deleteCount> <base64-command-or-dash>` | Modifica la copia temporanea: elimina le righe indicate e, se il payload non è `-`, inserisce un comando codificato Base64. |
+| `PATCH_COMMIT <targetCrc>` | Verifica limiti e CRC della nuova sequenza, quindi la rende residente in un'unica operazione. |
 | `LIST` | Elenca la sequenza con indici a partire da zero. |
 | `CLEAR` | Conferma subito la cancellazione della sequenza in memoria, poi ferma l’esecuzione e porta relay, ventola e NeoPixel allo stato sicuro. Non cancella il file SD. |
 | `SAVE` | Cifra e salva la sequenza in `/MyDot.run`. |
