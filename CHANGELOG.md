@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.12
+
+- Improved Dev Studio Bridge task scheduling, cloud publishing, and runtime
+  diagnostics.
+- Added mathematical runtime commands, including trigonometric functions.
+- Reduced USB serial backpressure across supported boards and rate-limited
+  resident `SERIAL` output without slowing the runtime.
+- Added CRC-checked incremental runtime patch commands to update the resident
+  sequence transactionally.
+
 ## 1.0.11
 
 - Increased the Dev Studio Bridge runtime variable capacity from 16 to 48.
